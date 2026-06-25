@@ -1,5 +1,6 @@
 import math
 
+#distance between 2 points
 def distance(lat1, lon1, lat2, lon2):
     r = 6371000 #earth radius in meters
     #convert deg -> radians
@@ -19,7 +20,7 @@ def distance(lat1, lon1, lat2, lon2):
 
     return d
 
-
+#initial bearing between two points
 def bearing(lat1, lon1, lat2, lon2):
     #convert deg -> radians
     
