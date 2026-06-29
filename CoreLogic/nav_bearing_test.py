@@ -1,5 +1,5 @@
 from navigation import distance, bearing
-from LEDLogic import relative_bearing, led_for_bearing
+from Kandi.CoreLogic.Led_Logic import relative_bearing, led_for_bearing
 
 # --- relative_bearing tests ---
 print("Target N, facing N:", relative_bearing(0, 0),   "(expect 0)")
