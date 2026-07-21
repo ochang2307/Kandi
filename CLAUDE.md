@@ -102,6 +102,56 @@ Safety: NEVER transmit without the LoRa antenna attached — it can destroy
 the RF output stage. Any firmware that could TX at boot must be flashed
 with the antenna on.
 
+## Firmware bring-up notes (hard-won — read before touching power/I2C/OLED)
+
+These cost real debugging time during OLED bring-up. Firmware lives in
+`Firmware/` (PlatformIO). Thin hardware drivers so far: `power.cpp` (PMU),
+`oled.cpp`/`oled.h` (display).
+
+**Power-on order: init the PMU FIRST.** The AXP2101 gates every peripheral
+3.3V rail, and they boot OFF. The ESP32 itself runs from an always-on rail
+(DCDC1), so serial prints fine with zero PMU setup — but the OLED, GPS, IMU,
+mag, and LoRa are all dark until their rails are enabled. `initBoardPower()`
+in `power.cpp` does this (`lewisxhe/XPowersLib`). The PMU is on a SEPARATE
+I2C bus: **Wire1, SDA 42 / SCL 41** (OLED/mag are on Wire, 17/18). Rail map
+ported from LilyGo's Factory firmware, `T_BEAM_S3_SUPREME` branch: ALDO4=GPS,
+ALDO3=LoRa, ALDO1/ALDO2=sensors (IMU+mag), BLDO1/2=SD, DCDC3/4/5=expansion.
+No rail is individually labeled "OLED" — bring up the whole set. Chip ID
+reads back 0x4A.
+
+**The 17/18 I2C bus addresses are a trap:**
+- `0x3C` = **QMC6310N magnetometer**, NOT the OLED. The QMC6310**N** variant
+  answers at 0x3C — which is also the default OLED address most libraries
+  assume. Display writes there ACK cleanly but do nothing (and wedged u8g2).
+  This was the single biggest gotcha on this board.
+- `0x3D` = **SH1106 OLED.** Detect at runtime, don't hardcode: read register
+  0x00 from each of 0x3C/0x3D — the mag returns chip-id `0x80`, the OLED does
+  not (LilyGo's own disambiguation). `main.cpp` does this in setup.
+- `0x77` = BME280 (if populated).
+- Pins on both buses (17/18 and 42/41) and the SH1106 model are confirmed
+  against LilyGo source, not just the product listing.
+
+**Do NOT use u8g2 on this board.** On ESP32-S3 + arduino-esp32 2.0.17, u8g2's
+HW-I2C path puts the bus into a state where every transfer takes ~1 second (a
+full frame ~60–80s — it looks like a hang). Ruled out clock speed, Wire buffer
+size, and the internal re-`Wire.begin`; root cause never fully pinned down.
+Raw `Wire` transfers on the same bus are fast and clean: a full 8-page frame
+is ~24ms at 400kHz (measured; the bus is happy up to 400kHz). So we drive the
+panel with a thin hand-rolled driver, `oled.cpp`/`oled.h`: own init sequence
+(SH1106 DC-DC on via `0xAD,0x8B`), framebuffer pushed as 8 page writes,
+built-in 5x7 font. Fits the thin-hardware-driver principle above.
+- SH1106 quirk: 132-column RAM, visible columns are 2–129, so pages are
+  written with a **2-column offset** (`0x02`/`0x10`).
+- Wire caveat: a full 128-byte page + the `0x40` control byte = 129 bytes,
+  which overflows the default 128-byte ESP32 Wire TX buffer (drops the last
+  column). Harmless while text stays left of column 127; call
+  `Wire.setBufferSize(256)` before drawing full-width.
+
+**Toolchain:** `pio` isn't on PATH — use `~/.platformio/penv/bin/pio`. Env is
+`[env:tbeam-supreme]`, board `esp32-s3-devkitc-1` (generic S3; flashes and
+runs fine). Build + flash + watch serial in one shot:
+`~/.platformio/penv/bin/pio run -t upload -t monitor` (Ctrl-C quits monitor).
+
 ## Working style
 
 Owen is learning as he builds — that's half the point of the project.
@@ -119,8 +169,11 @@ formulaic writing.
 ## Near-term milestones (in order)
 
 1. Toolchain bring-up: flash a blink/hello to one T-Beam via PlatformIO.
+   — DONE.
 2. Peripheral bring-up, one board: OLED text, GPS NMEA parse to lat/lon,
    IMU + mag raw reads, LED ring lit.
+   — PMU power-up + OLED text DONE (see firmware notes above). GPS, IMU,
+     mag, and LED ring still to do.
 3. Port compass to C++; add hard-iron calibration routine (figure-eight
    capture) — this is new work, not ported, and needs real mag data.
 4. Port navigation + LED logic (direct translation of the Python).
