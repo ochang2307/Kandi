@@ -1,9 +1,16 @@
 #include <Arduino.h>
 #include <Wire.h>
+#include <FastLED.h>
 #include "power.h"
 #include "oled.h"
+#include "gps.h"
 
-int counter = 0;
+// WS2812 ring: 16 LEDs, data-in on IO2 (a free S3 GPIO, not a strapping pin).
+#define LED_PIN   2
+#define NUM_LEDS  16
+CRGB leds[NUM_LEDS];       // pixel buffer; edits here do nothing until FastLED.show()
+
+int ledIndex = 0;          // current position of the chase around the ring
 
 void setup() {
     Serial.begin(115200);
@@ -18,6 +25,10 @@ void setup() {
     delay(100);
 
     // OLED + magnetometer share this bus: SDA=17, SCL=18.
+    // Bump the TX buffer past the 128-byte default first: a full-width page
+    // write is 128 data bytes + the 0x40 control byte = 129, and the GPS lines
+    // below do run to the right edge.
+    Wire.setBufferSize(256);
     Wire.begin(17, 18);
     Wire.setClock(400000);   // full 8-page frame ~24ms at 400kHz (measured clean)
 
@@ -49,17 +60,86 @@ void setup() {
     } else {
         Serial.println("no OLED found on 17/18");
     }
+
+    // --- WS2812 ring (additive; the PMU + OLED init above is untouched) ---
+    // addLeds<> binds the WS2812 chipset + GRB byte order to IO2 and our pixel
+    // buffer, and sets up the RMT peripheral that clocks out the one-wire
+    // protocol. Nothing lights until FastLED.show().
+    FastLED.addLeds<WS2812, LED_PIN, GRB>(leds, NUM_LEDS);
+    // Safety caps, set BEFORE any pixel is written: ~10% global brightness and a
+    // hard 500mA @ 5V power ceiling so the ring can never brown out the board.
+    // (16 WS2812s at full-white would pull ~1A.)
+    FastLED.setBrightness(25);
+    FastLED.setMaxPowerInVoltsAndMilliamps(5, 500);
+    FastLED.clear(true);   // start with the ring dark (all pixels off)
+
+    // --- GPS (additive) ---
+    // The ALDO4 rail feeding the MAX-M10S was already switched on by
+    // initBoardPower() above, so all that's left is the enable pin + UART.
+    if (gpsBegin()) {
+        Serial.println("GPS UART alive (bytes arriving)");
+    } else {
+        Serial.println("GPS silent -- no bytes in 2s. Set GPS_DEBUG_RAW 1 in gps.h");
+    }
 }
 
 void loop() {
-    oledClear();
-    oledText(0, 1, "KANDI");
+    // Drain the GPS UART on EVERY pass, not once per tick. The module streams
+    // ~960 bytes/sec at 9600 baud into a 256-byte driver buffer, so anything
+    // that stalls the loop for more than ~250ms silently overruns it and
+    // corrupts sentences. That's why the 1s cadence below is a millis() check
+    // and not the delay(1000) this loop used to end with.
+    gpsPump();
+
+    static uint32_t lastTick = 0;
+    if (millis() - lastTick < 1000) return;
+    lastTick = millis();
+
+    // --- everything below runs once per second ---
+
+    // WS2812 chase: one mid-brightness pixel walks around the ring, 1 step/sec.
+    FastLED.clear();                    // all pixels off (in the buffer)
+    leds[ledIndex] = CRGB(0, 0, 120);   // single lit pixel, mid-brightness blue
+    FastLED.show();                     // clock the buffer out to the ring
+
+    GpsStatus g = gpsStatus();
+
+    // Mirror the ring index on the OLED so screen + ring cross-check at a
+    // glance, and stack the GPS state underneath it.
     char line[24];
-    snprintf(line, sizeof(line), "alive %d", counter);
-    oledText(0, 3, line);
+    oledClear();
+
+    snprintf(line, sizeof(line), "KANDI       L:%02d", ledIndex);
+    oledText(0, 0, line);
+
+    snprintf(line, sizeof(line), "SATS:%2lu  HDOP %.1f",
+             (unsigned long)g.sats, g.hdop);
+    oledText(0, 2, line);
+
+    if (g.valid) {
+        snprintf(line, sizeof(line), "%.6f", g.lat);
+        oledText(0, 4, line);
+        snprintf(line, sizeof(line), "%.6f", g.lon);
+        oledText(0, 5, line);
+    } else {
+        // No fix yet: show the satellite count on its own line so it's obvious
+        // when it starts climbing, plus the raw byte count -- 0 bytes means the
+        // module is silent (a wiring/power problem), not just searching.
+        oledText(0, 4, "NO FIX");
+        snprintf(line, sizeof(line), "sats %lu  rx %lu B",
+                 (unsigned long)g.sats, (unsigned long)g.chars);
+        oledText(0, 5, line);
+    }
     oledShow();
 
-    Serial.println(line);
-    counter++;
-    delay(1000);
+    if (g.valid) {
+        Serial.printf("GPS: fix  sats=%lu  lat=%.6f  lon=%.6f  hdop=%.2f  (LED %d)\n",
+                      (unsigned long)g.sats, g.lat, g.lon, g.hdop, ledIndex);
+    } else {
+        Serial.printf("GPS: NO FIX  sats=%lu  rx=%lu bytes%s  (LED %d)\n",
+                      (unsigned long)g.sats, (unsigned long)g.chars,
+                      g.chars == 0 ? "  <- module silent!" : "", ledIndex);
+    }
+
+    ledIndex = (ledIndex + 1) % NUM_LEDS;   // wrap 0..15 with the ring
 }

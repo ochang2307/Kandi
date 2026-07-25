@@ -95,18 +95,18 @@ board revision before trusting):
 - OLED (I2C): SDA IO17, SCL IO18 — shared with QMC6310 magnetometer
 - QMI8658 IMU (SPI): SCLK IO36, MISO IO37, MOSI IO35, CS IO34, INT IO33
 - PMU AXP2101 (I2C): SDA IO42, SCL IO41, IRQ IO40
-- External LED ring (WS2812): pin TBD at bring-up — pick a free GPIO,
-  document it here.
+- External LED ring (WS2812): 16-LED ring, data-in IO2. Free GPIO, not an
+  ESP32-S3 strapping pin. Driven with FastLED (RMT); ring powered from 3V3.
 
 Safety: NEVER transmit without the LoRa antenna attached — it can destroy
 the RF output stage. Any firmware that could TX at boot must be flashed
 with the antenna on.
 
-## Firmware bring-up notes (hard-won — read before touching power/I2C/OLED)
+## Firmware bring-up notes (hard-won — read before touching power/I2C/OLED/GPS)
 
 These cost real debugging time during OLED bring-up. Firmware lives in
 `Firmware/` (PlatformIO). Thin hardware drivers so far: `power.cpp` (PMU),
-`oled.cpp`/`oled.h` (display).
+`oled.cpp`/`oled.h` (display), `gps.cpp`/`gps.h` (GNSS).
 
 **Power-on order: init the PMU FIRST.** The AXP2101 gates every peripheral
 3.3V rail, and they boot OFF. The ESP32 itself runs from an always-on rail
@@ -147,6 +147,41 @@ built-in 5x7 font. Fits the thin-hardware-driver principle above.
   column). Harmless while text stays left of column 127; call
   `Wire.setBufferSize(256)` before drawing full-width.
 
+**WS2812 ring (LED_PIN = IO2).** Driven with `fastled/FastLED`, RMT-backed on
+the S3 — so `FastLED.show()` does NOT block interrupts/I2C, and the OLED keeps
+updating alongside it. Power safety is non-negotiable: 16 WS2812s at full-white
+draw ~1A and will brown out the board. ALWAYS `FastLED.setBrightness(25)` +
+`FastLED.setMaxPowerInVoltsAndMilliamps(5, 500)` before writing any pixel, and
+never write full-brightness white. Color order for WS2812/WS2812B is GRB.
+
+**GPS (u-blox MAX-M10S).** Working: 11 sats / HDOP 1.0 / correct coords on
+first field check. `mikalhart/TinyGPSPlus` parses; `gps.cpp` is the driver.
+- **Two independent switches, not one.** The ALDO4 rail (already in
+  `initBoardPower()`) is necessary but NOT sufficient — the module also has its
+  own enable pin, **IO7, active HIGH**, which boots low. Rail on + enable low is
+  a totally silent UART that looks exactly like a dead rail. LilyGo drives this
+  in `beginGPS()`, separately from the PMU block.
+- **Pin names are from the ESP32's side:** GPS_RX IO9 = *we receive* (wired to
+  the module's TX), GPS_TX IO8 = we transmit. Swapping them also produces
+  silence, indistinguishable from the two failures above — hence the
+  `GPS_DEBUG_RAW` toggle at the top of `gps.h`: set it to 1 to echo raw bytes
+  to serial and settle "is it talking at all?" before blaming the parser.
+  1PPS is IO6 (input, unused so far). 9600 baud, SERIAL_8N1.
+- **Use a hardware UART, and pump it every loop pass.** `HardwareSerial(1)` —
+  `Serial` is USB CDC on this build (`ARDUINO_USB_CDC_ON_BOOT=1`), not a UART,
+  so it can't reach IO8/9 at all. At 9600 baud the module pushes ~960 B/s into
+  a 256-byte driver buffer, so **anything blocking the loop >250ms overruns it
+  and shreds sentences**. This is why `loop()` uses a `millis()` tick instead of
+  `delay(1000)`. Watch out when LoRa TX lands (~110ms airtime): if fixes get
+  flaky then, `gps.failedChecksum()` is the counter that proves it.
+- Verified against LilyGo's `LoRaBoards.cpp`, `T_BEAM_S3_SUPREME` branch. Note
+  that file has per-board `#ifdef` blocks — read the raw source and check which
+  branch you're in. (ALDO4=GPS, ALDO3=LoRa. A summarized read of that file got
+  this backwards.)
+- HDOP describes satellite *geometry*, not absolute error — real accuracy is
+  still ~2-3m at HDOP 1.0. Consistent with the design doc deferring final
+  approach to UWB + haptics.
+
 **Toolchain:** `pio` isn't on PATH — use `~/.platformio/penv/bin/pio`. Env is
 `[env:tbeam-supreme]`, board `esp32-s3-devkitc-1` (generic S3; flashes and
 runs fine). Build + flash + watch serial in one shot:
@@ -172,8 +207,9 @@ formulaic writing.
    — DONE.
 2. Peripheral bring-up, one board: OLED text, GPS NMEA parse to lat/lon,
    IMU + mag raw reads, LED ring lit.
-   — PMU power-up + OLED text DONE (see firmware notes above). GPS, IMU,
-     mag, and LED ring still to do.
+   — PMU power-up, OLED text, WS2812 ring (chase demo), and GPS (lat/lon +
+     sats/HDOP to OLED and serial) DONE (see firmware notes above). IMU and
+     mag still to do.
 3. Port compass to C++; add hard-iron calibration routine (figure-eight
    capture) — this is new work, not ported, and needs real mag data.
 4. Port navigation + LED logic (direct translation of the Python).
