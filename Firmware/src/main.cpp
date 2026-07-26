@@ -4,6 +4,8 @@
 #include "power.h"
 #include "oled.h"
 #include "gps.h"
+#include "imu.h"
+#include "mag.h"
 
 // WS2812 ring: 16 LEDs, data-in on IO2 (a free S3 GPIO, not a strapping pin).
 #define LED_PIN   2
@@ -11,6 +13,9 @@
 CRGB leds[NUM_LEDS];       // pixel buffer; edits here do nothing until FastLED.show()
 
 int ledIndex = 0;          // current position of the chase around the ring
+
+bool imuOk = false;        // did the IMU answer its chip-ID read at boot?
+bool magOk = false;        // ditto for the magnetometer
 
 void setup() {
     Serial.begin(115200);
@@ -81,6 +86,17 @@ void setup() {
     } else {
         Serial.println("GPS silent -- no bytes in 2s. Set GPS_DEBUG_RAW 1 in gps.h");
     }
+
+    // --- Sensors (additive) ---
+    // Both hang off the ALDO1/ALDO2 rails already enabled in initBoardPower().
+    // A failure here is a chip-ID read that didn't come back: unpowered or
+    // miswired, as opposed to a sensor that answers but reads garbage (for that,
+    // flip the *_DEBUG_RAW toggles in imu.h / mag.h).
+    imuOk = imuBegin();
+    Serial.println(imuOk ? "IMU  chip ID OK" : "IMU  chip ID FAILED (no response)");
+
+    magOk = magBegin();
+    Serial.println(magOk ? "MAG  chip ID OK" : "MAG  chip ID FAILED (no response)");
 }
 
 void loop() {
@@ -104,8 +120,16 @@ void loop() {
 
     GpsStatus g = gpsStatus();
 
+    // Both sensor reads are non-blocking and return false rather than waiting,
+    // so a sulking sensor can't stall the loop and starve the GPS UART.
+    ImuData imu;
+    MagData m;
+    bool haveImu = imuOk && imuRead(imu);
+    bool haveMag = magOk && magRead(m);
+
     // Mirror the ring index on the OLED so screen + ring cross-check at a
-    // glance, and stack the GPS state underneath it.
+    // glance, then stack GPS and sensor state underneath it. Lines are kept
+    // under 21 chars -- that's the 5x7 font's limit across 128px.
     char line[24];
     oledClear();
 
@@ -114,22 +138,41 @@ void loop() {
 
     snprintf(line, sizeof(line), "SATS:%2lu  HDOP %.1f",
              (unsigned long)g.sats, g.hdop);
-    oledText(0, 2, line);
+    oledText(0, 1, line);
 
     if (g.valid) {
         snprintf(line, sizeof(line), "%.6f", g.lat);
-        oledText(0, 4, line);
+        oledText(0, 2, line);
         snprintf(line, sizeof(line), "%.6f", g.lon);
-        oledText(0, 5, line);
+        oledText(0, 3, line);
     } else {
         // No fix yet: show the satellite count on its own line so it's obvious
         // when it starts climbing, plus the raw byte count -- 0 bytes means the
         // module is silent (a wiring/power problem), not just searching.
-        oledText(0, 4, "NO FIX");
+        oledText(0, 2, "NO FIX");
         snprintf(line, sizeof(line), "sats %lu  rx %lu B",
                  (unsigned long)g.sats, (unsigned long)g.chars);
-        oledText(0, 5, line);
+        oledText(0, 3, line);
     }
+
+    // Accel in m/s^2 to 1dp: at rest one axis should read about +/-9.8 and the
+    // other two near 0. Tilt the board and watch gravity move between axes.
+    if (haveImu) {
+        snprintf(line, sizeof(line), "A %5.1f %5.1f %5.1f", imu.ax, imu.ay, imu.az);
+    } else {
+        snprintf(line, sizeof(line), "A %s", imuOk ? "no data" : "OFFLINE");
+    }
+    oledText(0, 5, line);
+
+    // Mag in whole microtesla: the total field should be ~25-65uT anywhere on
+    // Earth, and the values should swing as you rotate the board.
+    if (haveMag) {
+        snprintf(line, sizeof(line), "M %5.0f %5.0f %5.0f", m.mx, m.my, m.mz);
+    } else {
+        snprintf(line, sizeof(line), "M %s", magOk ? "no data" : "OFFLINE");
+    }
+    oledText(0, 6, line);
+
     oledShow();
 
     if (g.valid) {
@@ -139,6 +182,22 @@ void loop() {
         Serial.printf("GPS: NO FIX  sats=%lu  rx=%lu bytes%s  (LED %d)\n",
                       (unsigned long)g.sats, (unsigned long)g.chars,
                       g.chars == 0 ? "  <- module silent!" : "", ledIndex);
+    }
+
+    // No math here on purpose -- this step only proves the sensors respond.
+    // Heading, tilt compensation and calibration are milestone 3.
+    if (haveImu) {
+        Serial.printf("IMU: accel %7.3f %7.3f %7.3f m/s2   gyro %8.3f %8.3f %8.3f dps\n",
+                      imu.ax, imu.ay, imu.az, imu.gx, imu.gy, imu.gz);
+    } else {
+        Serial.printf("IMU: %s\n", imuOk ? "no new sample this tick" : "OFFLINE (chip ID failed at boot)");
+    }
+
+    if (haveMag) {
+        Serial.printf("MAG: %8.2f %8.2f %8.2f uT%s\n",
+                      m.mx, m.my, m.mz, m.overflow ? "   <- OVERFLOW" : "");
+    } else {
+        Serial.printf("MAG: %s\n", magOk ? "read failed this tick" : "OFFLINE (chip ID failed at boot)");
     }
 
     ledIndex = (ledIndex + 1) % NUM_LEDS;   // wrap 0..15 with the ring

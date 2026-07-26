@@ -102,11 +102,12 @@ Safety: NEVER transmit without the LoRa antenna attached — it can destroy
 the RF output stage. Any firmware that could TX at boot must be flashed
 with the antenna on.
 
-## Firmware bring-up notes (hard-won — read before touching power/I2C/OLED/GPS)
+## Firmware bring-up notes (hard-won — read before touching any peripheral)
 
 These cost real debugging time during OLED bring-up. Firmware lives in
 `Firmware/` (PlatformIO). Thin hardware drivers so far: `power.cpp` (PMU),
-`oled.cpp`/`oled.h` (display), `gps.cpp`/`gps.h` (GNSS).
+`oled.cpp`/`oled.h` (display), `gps.cpp`/`gps.h` (GNSS), `imu.cpp`/`imu.h`
+(QMI8658), `mag.cpp`/`mag.h` (QMC6310N).
 
 **Power-on order: init the PMU FIRST.** The AXP2101 gates every peripheral
 3.3V rail, and they boot OFF. The ESP32 itself runs from an always-on rail
@@ -182,6 +183,54 @@ first field check. `mikalhart/TinyGPSPlus` parses; `gps.cpp` is the driver.
   still ~2-3m at HDOP 1.0. Consistent with the design doc deferring final
   approach to UWB + haptics.
 
+**IMU + magnetometer (QMI8658 / QMC6310N).** Both responding. Drivers are
+`imu.cpp`/`imu.h` and `mag.cpp`/`mag.h`, using `lewisxhe/SensorLib`. Rails
+(ALDO1/ALDO2) were already correct in `initBoardPower()` — SensorLib's own
+T-Beam Supreme examples do the identical disable → 250ms → 3300mV → enable
+dance.
+
+- **SensorLib version skew — check before writing code.** The PlatformIO
+  registry ships **v0.4.1**, whose API is `SensorQMI8658.hpp` /
+  `SensorQMC6310.hpp` with `configAccelerometer(ACC_RANGE_8G, ACC_ODR_1000Hz,
+  LPF_MODE_0)`, `getAccelerometer(x,y,z)`, `getDataReady()`. GitHub `master` is
+  AHEAD of that and uses different umbrella headers (`ImuDrv.hpp`,
+  `MagnetometerDrv.hpp`) — its examples will not compile against the release.
+  Read the headers actually installed under `.pio/libdeps/`, not the repo.
+- **`getAccelerometer()` returns g, not m/s².** It scales raw counts by
+  range/32768, so at rest an axis reads ~1.0. `imuRead()` converts to m/s²
+  explicitly. Miss this and the gravity vector is 9.8x too small.
+- **Magnetometer must be configured into CONTINUOUS_MEASUREMENT.** It boots in
+  suspend and returns plausible-looking stale data otherwise — a failure mode
+  that reads as "working" until headings make no sense.
+- **Use FS_8G for the mag, not FS_2G.** Measured field on this board is ~299 µT
+  total (see below). FS_2G is only 200 µT full scale — the Y axis alone would
+  saturate. FS_8G (800 µT) has ample headroom and 16-bit resolution is still
+  plenty.
+
+**Interpreting the readings (baseline, board flat on a table):**
+- Accel `0.5, 0.9, 10.0` m/s² → magnitude 10.05 vs 9.81 expected (+2.5%, normal
+  part tolerance). Gravity almost entirely in Z = board is flat, Z is vertical.
+  Residual X/Y implies ~6° apparent tilt: zero-g bias plus a non-level table.
+  Tilt compensation derives pitch/roll from this vector, so that bias becomes a
+  few degrees of heading error — consider capturing accel offsets during the
+  milestone-3 calibration too.
+- Mag `169, -246, 9` µT → magnitude **299 µT** against Earth's 25–65 µT. This is
+  expected **hard-iron offset** (~250 µT), almost certainly the 18650 holder's
+  steel springs and board components: a constant additive vector in the sensor
+  frame. It is exactly what the figure-eight calibration removes — rotating
+  through all orientations traces a sphere of radius ~50 µT whose *center* is
+  the offset; subtract the center to recover the real field.
+  Rule out environmental sources first (laptop lid magnets and phone speakers
+  are strong enough to swamp this): re-read 30cm away from any laptop/phone. A
+  large change means environmental — which moves with you and does NOT
+  calibrate out. Unchanged means board hard iron, which is fixed and does.
+- **A static reading cannot distinguish "working" from "frozen at plausible
+  values."** The real confirmation is motion: spin the board flat and X/Y should
+  each swing ~±20 µT around their offsets (the horizontal component is only
+  ~20 µT in the continental US — the field points steeply down), while Z barely
+  moves. For accel, tip the board onto each edge and watch the ~9.8 migrate
+  between axes.
+
 **Toolchain:** `pio` isn't on PATH — use `~/.platformio/penv/bin/pio`. Env is
 `[env:tbeam-supreme]`, board `esp32-s3-devkitc-1` (generic S3; flashes and
 runs fine). Build + flash + watch serial in one shot:
@@ -207,9 +256,9 @@ formulaic writing.
    — DONE.
 2. Peripheral bring-up, one board: OLED text, GPS NMEA parse to lat/lon,
    IMU + mag raw reads, LED ring lit.
-   — PMU power-up, OLED text, WS2812 ring (chase demo), and GPS (lat/lon +
-     sats/HDOP to OLED and serial) DONE (see firmware notes above). IMU and
-     mag still to do.
+   — DONE: PMU power-up, OLED text, WS2812 ring (chase demo), GPS (lat/lon +
+     sats/HDOP), IMU + mag raw reads. See firmware notes above for what the
+     baseline sensor values mean.
 3. Port compass to C++; add hard-iron calibration routine (figure-eight
    capture) — this is new work, not ported, and needs real mag data.
 4. Port navigation + LED logic (direct translation of the Python).
