@@ -6,21 +6,63 @@
 #include "gps.h"
 #include "imu.h"
 #include "mag.h"
+#include "compass.h"
+#include "navigation.h"
+#include "ledlogic.h"
+#include "selftest.h"
 
 // WS2812 ring: 16 LEDs, data-in on IO2 (a free S3 GPIO, not a strapping pin).
 #define LED_PIN   2
 #define NUM_LEDS  16
 CRGB leds[NUM_LEDS];       // pixel buffer; edits here do nothing until FastLED.show()
 
-int ledIndex = 0;          // current position of the chase around the ring
+// --- Test waypoint (edit these to move the target) ---
+// ~100m due north of 20090 Glasgow Dr: verified with the ported haversine as
+// 100.1m / bearing 360.0 from the front door. Stand at the house and the top
+// LED pair should light when the board points north.
+#define TARGET_LAT 37.276481
+#define TARGET_LON -122.024791
+
+// Ring display state. The 1s nav tick DECIDES (mode + which logical LED), the
+// fast render tick below DRAWS. Split so the no-fix pulse can breathe smoothly
+// at ~40fps without the nav math running any faster than 1Hz.
+enum RingMode { RING_SEARCHING, RING_POINTING };
+RingMode ringMode   = RING_SEARCHING;
+int      pointerLed = 0;   // logical sector 0-7 (0 = top), valid when POINTING
 
 bool imuOk = false;        // did the IMU answer its chip-ID read at boot?
 bool magOk = false;        // ditto for the magnetometer
+
+// Draw the current ring state. Called every ~25ms from loop().
+//
+// This is the display layer, so the logical->physical mapping lives HERE, not
+// in ledForBearing(): logical sector s (45 deg wide, 0 = top, clockwise) lights
+// physical pair {2s, 2s+1} on the 16-LED ring. That assumes physical LED 0 sits
+// at 12 o'clock with indices running clockwise -- if the ring ends up mounted
+// rotated, fix it in this function with an offset, never in the logic.
+static void renderRing() {
+    FastLED.clear();
+    if (ringMode == RING_POINTING) {
+        leds[(pointerLed * 2)     % NUM_LEDS] = CRGB(0, 0, 120);
+        leds[(pointerLed * 2 + 1) % NUM_LEDS] = CRGB(0, 0, 120);
+    } else {
+        // Searching: one pixel at the top breathing on a ~2s triangle wave.
+        // Unmistakably different from the steady two-pixel pointer.
+        uint8_t breath = triwave8((uint8_t)(millis() / 8));   // 256 steps x 8ms
+        leds[0] = CRGB(0, 0, scale8(breath, 120));
+    }
+    FastLED.show();
+}
 
 void setup() {
     Serial.begin(115200);
     delay(2000);
     Serial.println("Kandi board 1 boot");
+
+    // Prove the ported core logic still matches the verified Python before
+    // touching any hardware. Pure math -- needs nothing but serial. A FAIL
+    // line here means the port diverged; catch it at boot, not in a field test.
+    runSelfTests();
 
     // Power up the board rails FIRST. The OLED (and GPS, IMU, mag, LoRa) sit
     // on AXP2101-switched 3.3V rails that boot OFF.
@@ -107,33 +149,68 @@ void loop() {
     // and not the delay(1000) this loop used to end with.
     gpsPump();
 
+    // Fast render tick: redraw the ring every ~25ms so the searching pulse
+    // breathes smoothly. Costs ~0.5ms per frame over RMT (non-blocking for
+    // I2C/interrupts), nowhere near the 250ms GPS overrun budget.
+    static uint32_t lastRender = 0;
+    if (millis() - lastRender >= 25) {
+        lastRender = millis();
+        renderRing();
+    }
+
     static uint32_t lastTick = 0;
     if (millis() - lastTick < 1000) return;
     lastTick = millis();
 
     // --- everything below runs once per second ---
 
-    // WS2812 chase: one mid-brightness pixel walks around the ring, 1 step/sec.
-    FastLED.clear();                    // all pixels off (in the buffer)
-    leds[ledIndex] = CRGB(0, 0, 120);   // single lit pixel, mid-brightness blue
-    FastLED.show();                     // clock the buffer out to the ring
-
     GpsStatus g = gpsStatus();
 
-    // Both sensor reads are non-blocking and return false rather than waiting,
-    // so a sulking sensor can't stall the loop and starve the GPS UART.
-    ImuData imu;
-    MagData m;
-    bool haveImu = imuOk && imuRead(imu);
-    bool haveMag = magOk && magRead(m);
+    // One pass of the compass pipeline. This is also where the accel and mag get
+    // sampled -- it hands the raw values back so the readouts below don't have to
+    // read the sensors a second time (imuRead() gates on a data-ready flag, so an
+    // immediate repeat call would just come back empty). Non-blocking throughout.
+    CompassData c = compassHeading();
+    ImuData &imu = c.imu;
+    MagData &m = c.mag;
+    bool haveImu = imuOk && c.haveImu;
+    bool haveMag = magOk && c.haveMag;
 
-    // Mirror the ring index on the OLED so screen + ring cross-check at a
-    // glance, then stack GPS and sensor state underneath it. Lines are kept
+    // The compass can miss a tick (data-ready gate), and a one-tick heading
+    // dropout shouldn't make the ring flicker back to "searching" -- so hold
+    // the last good heading. GPS validity is NOT held the same way: gpsStatus()
+    // already does its own 5s freshness window internally.
+    static float lastHeading  = 0.0f;
+    static bool  haveHeading  = false;
+    if (c.ok) {
+        lastHeading = c.heading;
+        haveHeading = true;
+    }
+
+    // --- Navigation: current fix -> target, through the ported core logic ---
+    // distance()/bearing() are the haversine pair, then relativeBearing()
+    // subtracts where the device points, then ledForBearing() buckets into the
+    // 8 logical sectors. Exactly the Python pipeline, on live data.
+    double distM = 0.0, targetBrg = 0.0;
+    float  relBrg = 0.0f;
+    bool   navValid = g.valid && haveHeading;
+    if (navValid) {
+        distM     = distance(g.lat, g.lon, TARGET_LAT, TARGET_LON);
+        targetBrg = bearing(g.lat, g.lon, TARGET_LAT, TARGET_LON);
+        relBrg    = relativeBearing((float)targetBrg, lastHeading);
+        pointerLed = ledForBearing(relBrg);
+        ringMode   = RING_POINTING;
+    } else {
+        ringMode = RING_SEARCHING;
+    }
+
+    // Stack GPS, compass, sensor, and nav state on the OLED. Lines are kept
     // under 21 chars -- that's the 5x7 font's limit across 128px.
     char line[24];
     oledClear();
 
-    snprintf(line, sizeof(line), "KANDI       L:%02d", ledIndex);
+    snprintf(line, sizeof(line), "KANDI      %s",
+             navValid ? "NAV" : "SEARCH");
     oledText(0, 0, line);
 
     snprintf(line, sizeof(line), "SATS:%2lu  HDOP %.1f",
@@ -155,6 +232,17 @@ void loop() {
         oledText(0, 3, line);
     }
 
+    // Heading, tilt-compensated, degrees clockwise from north. Pitch and roll
+    // ride alongside it so a heading that looks wrong can be checked against the
+    // tilt it was derived from.
+    if (c.ok) {
+        snprintf(line, sizeof(line), "HDG %5.1f P%+3.0f R%+3.0f",
+                 c.heading, c.pitchDeg, c.rollDeg);
+    } else {
+        snprintf(line, sizeof(line), "HDG --  (no sample)");
+    }
+    oledText(0, 4, line);
+
     // Accel in m/s^2 to 1dp: at rest one axis should read about +/-9.8 and the
     // other two near 0. Tilt the board and watch gravity move between axes.
     if (haveImu) {
@@ -173,19 +261,28 @@ void loop() {
     }
     oledText(0, 6, line);
 
+    // Nav summary on the bottom page: distance, absolute bearing to target,
+    // relative bearing, and which logical LED is lit. Cross-checks the ring.
+    if (navValid) {
+        snprintf(line, sizeof(line), "T%5.0fm B%03.0f R%03.0f L%d",
+                 distM, targetBrg, relBrg, pointerLed);
+    } else {
+        snprintf(line, sizeof(line), "TGT --  %s",
+                 g.valid ? "(no heading)" : "(no fix)");
+    }
+    oledText(0, 7, line);
+
     oledShow();
 
     if (g.valid) {
-        Serial.printf("GPS: fix  sats=%lu  lat=%.6f  lon=%.6f  hdop=%.2f  (LED %d)\n",
-                      (unsigned long)g.sats, g.lat, g.lon, g.hdop, ledIndex);
+        Serial.printf("GPS: fix  sats=%lu  lat=%.6f  lon=%.6f  hdop=%.2f\n",
+                      (unsigned long)g.sats, g.lat, g.lon, g.hdop);
     } else {
-        Serial.printf("GPS: NO FIX  sats=%lu  rx=%lu bytes%s  (LED %d)\n",
+        Serial.printf("GPS: NO FIX  sats=%lu  rx=%lu bytes%s\n",
                       (unsigned long)g.sats, (unsigned long)g.chars,
-                      g.chars == 0 ? "  <- module silent!" : "", ledIndex);
+                      g.chars == 0 ? "  <- module silent!" : "");
     }
 
-    // No math here on purpose -- this step only proves the sensors respond.
-    // Heading, tilt compensation and calibration are milestone 3.
     if (haveImu) {
         Serial.printf("IMU: accel %7.3f %7.3f %7.3f m/s2   gyro %8.3f %8.3f %8.3f dps\n",
                       imu.ax, imu.ay, imu.az, imu.gx, imu.gy, imu.gz);
@@ -200,5 +297,27 @@ void loop() {
         Serial.printf("MAG: %s\n", magOk ? "read failed this tick" : "OFFLINE (chip ID failed at boot)");
     }
 
-    ledIndex = (ledIndex + 1) % NUM_LEDS;   // wrap 0..15 with the ring
+    // Heading is only as good as the hard-iron offsets, which are still zero --
+    // expect it to be badly biased (and to barely move) until the figure-eight
+    // calibration fills them in. The offsets are echoed so it's obvious from the
+    // log alone which state you're looking at.
+    if (c.ok) {
+        Serial.printf("CMP: heading %6.1f deg  pitch %6.1f  roll %6.1f  "
+                      "(offsets %.1f %.1f %.1f uT)\n",
+                      c.heading, c.pitchDeg, c.rollDeg,
+                      magOffsetX, magOffsetY, magOffsetZ);
+    } else {
+        Serial.printf("CMP: no heading (%s%s)\n",
+                      c.haveImu ? "" : "no accel sample ",
+                      c.haveMag ? "" : "no mag sample");
+    }
+
+    if (navValid) {
+        Serial.printf("NAV: dist %.1fm  brg %.1f  rel %.1f  -> LED %d (pair %d+%d)\n",
+                      distM, targetBrg, relBrg, pointerLed,
+                      pointerLed * 2, pointerLed * 2 + 1);
+    } else {
+        Serial.printf("NAV: searching (%s)\n",
+                      g.valid ? "fix ok, waiting on heading" : "no GPS fix");
+    }
 }
