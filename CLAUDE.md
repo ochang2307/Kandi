@@ -62,7 +62,9 @@ its own files/functions, hardware drivers thin and separate.
 ## Locked-in design decisions (from the design doc — don't relitigate)
 
 - Radio: SX1262, 915MHz, Meshtastic "Long Fast" preset (SF11, 250kHz,
-  CR 4/5). ~110ms airtime per position packet.
+  CR 4/5). ~110ms airtime per position packet. (NOTE: measured airtime on
+  hardware is ~200–250ms — the 110ms figure looks low; see the LoRa firmware
+  notes. Recheck before relying on it for mesh timing.)
 - Mesh: managed flooding. Hop limit 3, dedup via (sender, packet_id) cache,
   SNR-weighted relay delay (delay not yet implemented in sim — TODO on
   hardware). Group separation by shared AES key (v1 sim fakes this with
@@ -105,9 +107,12 @@ with the antenna on.
 ## Firmware bring-up notes (hard-won — read before touching any peripheral)
 
 These cost real debugging time during OLED bring-up. Firmware lives in
-`Firmware/` (PlatformIO). Thin hardware drivers so far: `power.cpp` (PMU),
+`Firmware/` (PlatformIO). Thin hardware drivers: `power.cpp` (PMU),
 `oled.cpp`/`oled.h` (display), `gps.cpp`/`gps.h` (GNSS), `imu.cpp`/`imu.h`
-(QMI8658), `mag.cpp`/`mag.h` (QMC6310N).
+(QMI8658), `mag.cpp`/`mag.h` (QMC6310N), `radio.cpp`/`radio.h` (SX1262 LoRa).
+Ported core logic (hardware-free, mirrors `CoreLogic/`): `compass.cpp`/`.h`,
+`navigation.cpp`/`.h`, `ledlogic.cpp`/`.h`, with `selftest.cpp`/`.h` running
+the ported logic against Python golden values at boot.
 
 **Power-on order: init the PMU FIRST.** The AXP2101 gates every peripheral
 3.3V rail, and they boot OFF. The ESP32 itself runs from an always-on rail
@@ -231,6 +236,146 @@ dance.
   moves. For accel, tip the board onto each edge and watch the ~9.8 migrate
   between axes.
 
+## Ported core logic (C++ on hardware)
+
+These mirror the verified `CoreLogic/` Python. The rule from the architecture
+principle holds: **translate exactly, don't "improve" the math** — the Python
+was bug-hunted and the ports are checked against it, so any "cleanup" is a
+divergence waiting to bite in a field test.
+
+**Compass (`compass.cpp`/`.h`).** Direct port of `tilt_compensation.py`:
+`pitchRoll()`, `tiltCompensate()`, `headingFrom()`, plus `compassHeading()`
+that samples both sensors and runs the pipeline.
+- **`float`, not `double`** — the S3 FPU is single-precision (doubles are
+  software-emulated), and float's ~7 digits is four orders of magnitude finer
+  than the 0.5° tolerance. This is the *opposite* choice from navigation.cpp
+  (see below) and the reason is deliberate: angles are small numbers, coords
+  are not.
+- The asymmetric `tiltCompensate` form (Xh has three terms, Yh two) is correct
+  and load-bearing — verified, do not "balance" it.
+- **`compassHeading()` returns the raw accel/mag it sampled** so callers don't
+  re-read. `imuRead()` gates on a data-ready flag, so a second immediate call
+  comes back empty — reading once and passing the samples out avoids a
+  perpetually dead heading. main.cpp relies on this.
+- **Hard-iron offsets are placeholders (`magOffsetX/Y/Z`, extern, = 0).**
+  Subtracted in the sensor frame *before* rotation. Until the figure-eight
+  calibration fills them in, heading is badly biased and barely moves (the
+  ~250 µT offset dwarfs the ~20 µT horizontal signal — see the baseline
+  reading notes above). This is expected, not a bug. Calibration is the
+  remaining piece of milestone 3.
+- Verified: the actual `compass.cpp` compiles on the host against a stub
+  `Arduino.h` and passes the same 26-case round-trip as `compass_test.py` at
+  err=0.0000. Links the real firmware source, not a copy.
+
+**Navigation (`navigation.cpp`/`.h`) + LED logic (`ledlogic.cpp`/`.h`).**
+Direct ports of `navigation.py` and `LEDLogic.py`.
+- **`double`, not float, for navigation** — a lat like `37.2755809` spends all
+  ~7 of a float's digits before the part that distinguishes you from a friend
+  50m away; float coords quantize position to meters and make short
+  distances/bearings garbage. Runs once per position update, not per loop, so
+  the software-emulated double cost is irrelevant.
+- **Python `%` vs C `fmod` sign trap.** Python's `%` is never negative for a
+  positive divisor; C's `fmod`/`fmodf` keep the dividend's sign. `norm360()`
+  (nav) and `norm360f()` (led) reproduce the Python so `(x + 360) % 360`
+  ports faithfully. Both `bearing()` and `relativeBearing()` route through
+  these.
+- **The haversine keeps `cos(lat1)*cos(lat1)`**, not the textbook
+  `cos(lat1)*cos(lat2)`. That's what the Python has and what the real-world
+  tests validated; for group members within a few km the two agree to ~7
+  decimals. Commented in the source so nobody "fixes" it into a divergence.
+- **`ledForBearing` uses `roundf` (half away from zero); Python `round` is
+  half-to-even.** They only disagree on exact multiples of 22.5°, which no
+  real reading hits. Documented in-source.
+- **Logical→physical LED mapping lives in the display layer (main.cpp
+  `renderRing()`), NOT in `ledForBearing`.** Logical sector `s` (8-sector
+  model, 0 = top, clockwise) lights physical pair `{2s, 2s+1}` on the 16-LED
+  ring. If the ring mounts rotated, fix it with an offset there — never in the
+  logic function. Assumes physical LED 0 at 12 o'clock, indices clockwise.
+
+**Boot self-tests (`selftest.cpp`/`.h`).** `runSelfTests()` runs first thing
+in `setup()` (pure math, needs only serial) and prints PASS/FAIL per case. The
+expected values are **golden values captured from the verified Python**, not
+re-derived — so a FAIL means the C++ diverged from `CoreLogic/`, caught on the
+bench instead of in the field. Covers distance (same-point ≈ 0, Taipei 101
+pair = 2070.5m), cardinal bearings, relative_bearing, and led boundary cases
+(44→1, 46→1, 359→0 wrap). Also runnable on the host — see
+`scratchpad/compasstest/` for the pattern (links real firmware sources).
+
+**Nav wired to the ring (main.cpp).** The chase demo is gone. Test waypoint is
+`TARGET_LAT`/`TARGET_LON` (#defines, currently ~100m N of the Saratoga house,
+geocoded + verified 100.1m/360° through the ported haversine). Two ring states:
+steady two-pixel pointer when a fix + heading are live (`RING_POINTING`), and a
+slow single-pixel breathing pulse at index 0 when not (`RING_SEARCHING`) — so
+"searching" and "pointing" are distinguishable at a glance. The nav math runs
+on the 1s tick; the ring redraws on a fast ~25ms tick so the pulse is smooth.
+A one-tick compass dropout holds the last heading rather than flickering to
+searching; GPS validity is not held (gpsStatus() has its own 5s freshness).
+
+**LoRa radio (`radio.cpp`/`.h`, SX1262 via `jgromes/RadioLib` 7.7.1).** Two
+boards exchanging position packets — milestone 5. Pins + init sequence verified
+against LilyGo's **Factory** example (`utilities.h` pin block +
+`Factory.ino` setup), `T_BEAM_S3_SUPREME_SX1262` branch — read the raw source
+and mind the per-board `#ifdef`s, same discipline as the GPS rails.
+
+- **`setDio2AsRfSwitch(true)` is mandatory and non-obvious.** On this module
+  DIO2 drives the TX/RX antenna switch. Without it every SPI command still
+  "succeeds" — the radio configures fine, `begin()` returns OK — but TX
+  radiates almost nothing and RX hears almost nothing, because the antenna is
+  never connected to the active path. A datasheet-only bring-up misses this;
+  it's in LilyGo's `setupRfSwitch()`. Also `setCurrentLimit(140)` (their
+  value; a ceiling, not a target).
+- **The radio owns the GLOBAL `SPI` object (FSPI, pins 12/13/11)**, started
+  with `SPI.begin(SCLK, MISO, MOSI)` like LilyGo does. This is the payoff for
+  imu.cpp deliberately using its own `SPIClass(HSPI)` back in milestone 2 —
+  the two SPI buses are physically separate and stay that way. Module ctor arg
+  order for the SX1262 is `(CS, DIO1, RST, BUSY)`.
+- **Sync word left at RadioLib's private default (0x12).** Meshtastic uses
+  0x2B, so we're deliberately invisible to Meshtastic nodes even on the shared
+  Long Fast preset. Preset is the locked-in one: 915 MHz, SF11, 250 kHz, CR
+  4/5, +14 dBm — do not tune.
+- **Non-blocking via DIO1 interrupt.** `startTransmit`/`startReceive` return in
+  ~1ms; the airtime happens inside the chip. The DIO1 ISR only sets a flag
+  (`IRAM_ATTR`, no SPI in an ISR — it would collide with a transfer in flight);
+  all real work is in `radioTick()`, called every loop pass like `gpsPump()`.
+  So airtime never stalls the loop and the GPS UART keeps draining.
+- **`IS_SENDER` is a COMPILE-TIME toggle (radio.h).** One codebase, one line
+  changed, flashed to each board. **You must build+flash twice** — the same
+  binary on both boards makes two senders (this actually happened: both showed
+  `TX` on the OLED header, which is the tell — sender header shows `TX`,
+  receiver `RX`). Safe habit: set the toggle, flash immediately, one board at a
+  time (avoids guessing USB ports). Sender TX begins seconds after boot →
+  **antenna on before flashing a sender build.**
+- **Packet format is versioned.** `TestPacket` is 17 bytes packed: 4-byte magic
+  `"KND2"`, `uint32` counter, lat/lon as `int32` in 1e-7 degrees (u-blox native
+  format — fixed width on air, ~1cm resolution, 8 bytes for the pair vs 16 for
+  two doubles), `uint8` fix-valid flag. The magic's version digit is bumped on
+  any layout change so a board on stale firmware gets *rejected*, not
+  misparsed. No fix yet still transmits (flag false) so the link is testable
+  indoors. Receiver computes true GPS distance with the ported `distance()`
+  only when both ends hold a fix.
+- **Measured airtime is ~200–250ms, NOT the design doc's ~110ms.** The
+  SF11/250kHz math on even a tiny packet lands well above 110ms. Doesn't matter
+  for the range test (non-blocking), but it affects mesh airtime/relay-delay
+  budgeting later — recheck the design doc's number against measured TX-done
+  timestamps before porting the mesh timing.
+- **`gps.failedChecksum()` is not yet surfaced through `GpsStatus`.** If fixes
+  degrade once the radio is active (the RF-interference symptom), that counter
+  is the proof — a small additive change to the struct will expose it.
+
+**RSSI/SNR for range testing.** RSSI (dBm) is raw received power, more negative
+= weaker. SNR (dB) is signal above the noise floor and is the *cliff*
+indicator: LoRa decodes *below* the noise (SF11 works to about **−17.5 dB
+SNR**), and links don't fade gracefully — they fall off within a few dB.
+Rough guide: RSSI > −90 / SNR > 5 = same room; −90 to −110 / 0 to 5 = healthy
+outdoor link; −110 to −125 / 0 to −15 = long range, working as designed; SNR
+approaching −17 with CRC errors climbing = the edge, note the distance. The
+receiver holds a **max-distance-ever-received** figure on screen (survives link
+death — it's the test result) and shows **seconds-since-last-packet** (age),
+because everything else freezes on stale values when the link dies; age is what
+tells a live link from a frozen display. Serial logs one line per packet
+(`grep "LORA: RX"`) with counter, distance, RSSI, SNR for the RSSI-vs-distance
+plot; gaps in the counter sequence are packet-loss-vs-distance for free.
+
 **Toolchain:** `pio` isn't on PATH — use `~/.platformio/penv/bin/pio`. Env is
 `[env:tbeam-supreme]`, board `esp32-s3-devkitc-1` (generic S3; flashes and
 runs fine). Build + flash + watch serial in one shot:
@@ -261,8 +406,19 @@ formulaic writing.
      baseline sensor values mean.
 3. Port compass to C++; add hard-iron calibration routine (figure-eight
    capture) — this is new work, not ported, and needs real mag data.
+   — PARTIAL: compass ported (`compass.cpp`, host round-trip verified).
+     Figure-eight calibration NOT done — offsets are still zero placeholders,
+     so live headings are badly biased. This is the remaining work here.
 4. Port navigation + LED logic (direct translation of the Python).
+   — DONE: `navigation.cpp` + `ledlogic.cpp`, boot self-tests against Python
+     golden values (`selftest.cpp`), and wired to the physical ring (pointer
+     vs searching states) with a test waypoint.
 5. LoRa link: two boards exchanging position packets (port mesh.py logic;
    real SX1262 TX/RX replaces transmit() placeholder).
+   — LINK DONE: `radio.cpp`, non-blocking SX1262 TX/RX, versioned position
+     packet (counter + lat/lon + fix flag), range-test readout (distance,
+     RSSI/SNR, packet-age, max-distance, drop gaps). Still TODO: port the
+     actual `mesh.py` logic (dedup cache, hop-limit, relay) on top of the raw
+     link, and the SNR-weighted relay delay.
 6. Integration: device_tick on hardware — board A's ring points at board B.
 7. Park field test + demo video. Then third board for mesh relay testing.

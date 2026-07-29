@@ -21,7 +21,7 @@
 // 1 = this board transmits a counter packet every 3s.
 // 0 = this board listens continuously and reports what it hears.
 // Flash one board with each; everything else is identical.
-#define IS_SENDER 0
+#define IS_SENDER 1
 
 struct RadioStats {
     bool     online;      // radio answered at init and is configured
@@ -31,6 +31,17 @@ struct RadioStats {
     uint32_t lastCounter; // counter value inside the newest packet
     float    rssi;        // dBm, of the newest packet
     float    snr;         // dB, of the newest packet
+
+    // Range-test fields (receiver role). Compare rxCount against
+    // lastCounter+1 to see dropped-packet gaps (counter starts at 0).
+    uint32_t lastRxMillis;   // millis() when the newest packet landed; 0 = never.
+                             //   The AGE derived from this is the liveness
+                             //   signal -- everything else here freezes at its
+                             //   last value when the link dies.
+    bool     senderHasFix;   // fix-valid flag inside the newest packet
+    bool     distValid;      // both sides had a fix; distM/maxDistM updated
+    double   distM;          // GPS distance to sender at the newest packet
+    double   maxDistM;       // farthest distance a packet has ever arrived from
 };
 
 // Bring up SPI + the SX1262 and configure the Long Fast preset. Returns false

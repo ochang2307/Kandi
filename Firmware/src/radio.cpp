@@ -2,6 +2,8 @@
 #include <SPI.h>
 #include <RadioLib.h>
 #include "radio.h"
+#include "gps.h"          // sender stamps its fix in; receiver compares fixes
+#include "navigation.h"   // receiver computes true GPS distance per packet
 
 // --- Pins (verified against LilyGo utilities.h, T_BEAM_S3_SUPREME block) ---
 // This is the radio's own SPI bus (FSPI / the global `SPI` object) -- fully
@@ -25,14 +27,24 @@ static const uint8_t LORA_SF       = 11;
 static const uint8_t LORA_CR       = 5;     // RadioLib takes the denominator: 4/5
 static const int8_t  LORA_TX_DBM   = 14;
 
-// Test packet: 4-byte magic + counter. The magic filters out other 915MHz
-// LoRa traffic that happens to share these settings -- without it, any
-// stranger's packet would bump our counter display.
+// Position packet, 17 bytes packed -- a step toward the real mesh packet.
+// The magic filters out other 915MHz LoRa traffic that happens to share these
+// settings, and its version digit is bumped ("KND2") whenever the layout
+// changes so a board running stale firmware gets rejected instead of
+// misparsed.
+//
+// Coordinates ride as int32 in 1e-7 degrees (the u-blox native format):
+// fixed width on the air regardless of platform double size, ~1.1cm
+// resolution -- far below GPS error -- and 8 bytes for the pair instead
+// of 16.
 struct __attribute__((packed)) TestPacket {
-    char     magic[4];   // "KND1"
+    char     magic[4];    // "KND2"
     uint32_t counter;
+    int32_t  latE7;       // degrees * 1e7; 0 when fixValid == 0
+    int32_t  lonE7;
+    uint8_t  fixValid;    // 1 = latE7/lonE7 are a live fix, 0 = ignore them
 };
-static const char PACKET_MAGIC[4] = {'K', 'N', 'D', '1'};
+static const char PACKET_MAGIC[4] = {'K', 'N', 'D', '2'};
 
 static RadioStats stats = {};
 static uint32_t   txCounter = 0;      // next counter value to send
@@ -112,9 +124,15 @@ void radioTick() {
     if (!txInFlight && millis() - lastTxStart >= 3000) {
         lastTxStart = millis();
 
+        // Stamp in our current fix. No fix yet is NOT a reason to stay quiet:
+        // the flag rides along as false and the link stays testable indoors.
+        GpsStatus g = gpsStatus();
         TestPacket pkt;
         memcpy(pkt.magic, PACKET_MAGIC, 4);
-        pkt.counter = txCounter;
+        pkt.counter  = txCounter;
+        pkt.fixValid = g.valid ? 1 : 0;
+        pkt.latE7    = g.valid ? (int32_t)llround(g.lat * 1e7) : 0;
+        pkt.lonE7    = g.valid ? (int32_t)llround(g.lon * 1e7) : 0;
 
         // Non-blocking: hands the packet to the radio and returns in ~a ms.
         // The airtime burns inside the SX1262 while the loop keeps running.
@@ -140,12 +158,35 @@ void radioTick() {
             && memcmp(buf, PACKET_MAGIC, 4) == 0) {
             TestPacket *pkt = (TestPacket *)buf;
             stats.rxCount++;
-            stats.lastCounter = pkt->counter;
-            stats.rssi = radio.getRSSI();
-            stats.snr  = radio.getSNR();
-            Serial.printf("LORA: RX #%lu  RSSI %.1f dBm  SNR %.1f dB  (n=%lu)\n",
-                          (unsigned long)pkt->counter, stats.rssi, stats.snr,
-                          (unsigned long)stats.rxCount);
+            stats.lastCounter  = pkt->counter;
+            stats.rssi         = radio.getRSSI();
+            stats.snr          = radio.getSNR();
+            stats.lastRxMillis = millis();
+            stats.senderHasFix = pkt->fixValid != 0;
+
+            // True GPS distance, only when BOTH ends hold a fix. distM/maxDistM
+            // keep their last values otherwise -- distValid is what says
+            // whether this packet refreshed them.
+            GpsStatus g = gpsStatus();
+            stats.distValid = stats.senderHasFix && g.valid;
+            if (stats.distValid) {
+                stats.distM = distance(g.lat, g.lon,
+                                       pkt->latE7 * 1e-7, pkt->lonE7 * 1e-7);
+                if (stats.distM > stats.maxDistM) stats.maxDistM = stats.distM;
+            }
+
+            // One line per packet, fixed field order -- grep "LORA: RX" and
+            // you have the RSSI-vs-distance dataset for the range plot.
+            if (stats.distValid) {
+                Serial.printf("LORA: RX #%lu  dist %.1f m  RSSI %.1f dBm  SNR %.1f dB  (n=%lu)\n",
+                              (unsigned long)pkt->counter, stats.distM,
+                              stats.rssi, stats.snr, (unsigned long)stats.rxCount);
+            } else {
+                Serial.printf("LORA: RX #%lu  dist --%s  RSSI %.1f dBm  SNR %.1f dB  (n=%lu)\n",
+                              (unsigned long)pkt->counter,
+                              stats.senderHasFix ? " (rx no fix)" : " (tx no fix)",
+                              stats.rssi, stats.snr, (unsigned long)stats.rxCount);
+            }
         } else if (state == RADIOLIB_ERR_CRC_MISMATCH) {
             // Arrived but corrupted -- starts happening at the edge of range.
             stats.crcErrors++;

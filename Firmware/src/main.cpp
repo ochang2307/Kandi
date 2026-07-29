@@ -284,21 +284,40 @@ void loop() {
     }
     oledText(0, 6, line);
 #else
-    // Receiver: these two pages show link quality instead of raw sensors
-    // (still on serial) -- this is the readout that matters for range testing.
+    // Receiver: bottom three pages are the range-test readout (raw sensors
+    // still print to serial).
     if (r.rxCount > 0) {
-        snprintf(line, sizeof(line), "PKT#%-6lu err %lu",
-                 (unsigned long)r.lastCounter, (unsigned long)r.crcErrors);
+        // Distance to sender now + the farthest a packet has ever made it.
+        // Max is held on screen even after the link dies -- that's the result
+        // of the range test.
+        if (r.distValid) {
+            snprintf(line, sizeof(line), "D%6.0fm mx%6.0fm", r.distM, r.maxDistM);
+        } else {
+            snprintf(line, sizeof(line), "D NOFIX  mx%6.0fm", r.maxDistM);
+        }
         oledText(0, 5, line);
+
         snprintf(line, sizeof(line), "RSSI%5.0f  SNR%5.1f", r.rssi, r.snr);
         oledText(0, 6, line);
+
+        // Received count vs sender counter (gap = drops) and seconds since
+        // the last packet -- the AGE is what separates "link alive" from
+        // "display frozen on stale numbers" at the edge of range.
+        uint32_t age = (millis() - r.lastRxMillis) / 1000;
+        snprintf(line, sizeof(line), "RX %lu/%lu age %lus",
+                 (unsigned long)r.rxCount, (unsigned long)(r.lastCounter + 1),
+                 (unsigned long)age);
+        oledText(0, 7, line);
     } else {
         oledText(0, 5, r.online ? "PKT --  listening" : "RADIO OFFLINE");
     }
 #endif
 
+#if IS_SENDER
     // Nav summary on the bottom page: distance, absolute bearing to target,
     // relative bearing, and which logical LED is lit. Cross-checks the ring.
+    // (The receiver uses page 7 for link liveness instead -- during a range
+    // test its screen belongs to the radio.)
     if (navValid) {
         snprintf(line, sizeof(line), "T%5.0fm B%03.0f R%03.0f L%d",
                  distM, targetBrg, relBrg, pointerLed);
@@ -307,6 +326,7 @@ void loop() {
                  g.valid ? "(no heading)" : "(no fix)");
     }
     oledText(0, 7, line);
+#endif
 
     oledShow();
 
