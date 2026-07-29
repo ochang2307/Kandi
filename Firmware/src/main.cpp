@@ -10,6 +10,7 @@
 #include "navigation.h"
 #include "ledlogic.h"
 #include "selftest.h"
+#include "radio.h"
 
 // WS2812 ring: 16 LEDs, data-in on IO2 (a free S3 GPIO, not a strapping pin).
 #define LED_PIN   2
@@ -139,6 +140,17 @@ void setup() {
 
     magOk = magBegin();
     Serial.println(magOk ? "MAG  chip ID OK" : "MAG  chip ID FAILED (no response)");
+
+    // --- LoRa (additive) ---
+    // ALDO3 rail is already up from initBoardPower(). The radio claims the
+    // global SPI bus (FSPI, 12/13/11) -- the IMU deliberately uses its own
+    // HSPI instance so this doesn't collide.
+#if IS_SENDER
+    Serial.println("!! SENDER build: TX begins in seconds. ANTENNA MUST BE ON. !!");
+#endif
+    if (!radioBegin()) {
+        Serial.println("LORA offline -- check ALDO3 / antenna / wiring");
+    }
 }
 
 void loop() {
@@ -148,6 +160,10 @@ void loop() {
     // corrupts sentences. That's why the 1s cadence below is a millis() check
     // and not the delay(1000) this loop used to end with.
     gpsPump();
+
+    // Radio state machine every pass, same contract as gpsPump(): never
+    // blocks, all airtime happens inside the SX1262 behind the DIO1 interrupt.
+    radioTick();
 
     // Fast render tick: redraw the ring every ~25ms so the searching pulse
     // breathes smoothly. Costs ~0.5ms per frame over RMT (non-blocking for
@@ -209,8 +225,14 @@ void loop() {
     char line[24];
     oledClear();
 
-    snprintf(line, sizeof(line), "KANDI      %s",
-             navValid ? "NAV" : "SEARCH");
+    RadioStats r = radioStats();
+#if IS_SENDER
+    snprintf(line, sizeof(line), "KANDI %-4s TX%5lu",
+             navValid ? "NAV" : "SRCH", (unsigned long)r.txCount);
+#else
+    snprintf(line, sizeof(line), "KANDI %-4s RX%5lu",
+             navValid ? "NAV" : "SRCH", (unsigned long)r.rxCount);
+#endif
     oledText(0, 0, line);
 
     snprintf(line, sizeof(line), "SATS:%2lu  HDOP %.1f",
@@ -243,6 +265,7 @@ void loop() {
     }
     oledText(0, 4, line);
 
+#if IS_SENDER
     // Accel in m/s^2 to 1dp: at rest one axis should read about +/-9.8 and the
     // other two near 0. Tilt the board and watch gravity move between axes.
     if (haveImu) {
@@ -260,6 +283,19 @@ void loop() {
         snprintf(line, sizeof(line), "M %s", magOk ? "no data" : "OFFLINE");
     }
     oledText(0, 6, line);
+#else
+    // Receiver: these two pages show link quality instead of raw sensors
+    // (still on serial) -- this is the readout that matters for range testing.
+    if (r.rxCount > 0) {
+        snprintf(line, sizeof(line), "PKT#%-6lu err %lu",
+                 (unsigned long)r.lastCounter, (unsigned long)r.crcErrors);
+        oledText(0, 5, line);
+        snprintf(line, sizeof(line), "RSSI%5.0f  SNR%5.1f", r.rssi, r.snr);
+        oledText(0, 6, line);
+    } else {
+        oledText(0, 5, r.online ? "PKT --  listening" : "RADIO OFFLINE");
+    }
+#endif
 
     // Nav summary on the bottom page: distance, absolute bearing to target,
     // relative bearing, and which logical LED is lit. Cross-checks the ring.
