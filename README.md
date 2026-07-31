@@ -28,12 +28,15 @@ requires a phone app. Apple's offline finding only works at ~10-30m.
   validated in simulation before any hardware existed.
 - ✅ **Phase 2 hardware bring-up: complete.** All peripherals working on
   LilyGo T-Beam Supreme dev boards — power management, display, GNSS, IMU,
-  magnetometer, addressable LED ring, and a confirmed LoRa link between two
-  boards.
+  magnetometer, addressable LED ring, and a LoRa link between two boards.
 - ✅ **Navigation pipeline on hardware.** Live GPS fix → distance and bearing
-  to a target → LED ring indication, running on-device.
+  to a target → LED ring indication, with the ported navigation stack passing
+  19 boot-time self-tests against its Python golden values.
+- ✅ **First field validation.** 635 m link range through residential
+  obstruction against a 500–800 m link-budget prediction; body absorption
+  measured at 11.2 dB.
 - 🔄 **In progress:** magnetometer hard-iron calibration, porting the mesh
-  protocol to firmware, and field range validation.
+  protocol to firmware, and the two-device demo.
 
 ## Hardware
 
@@ -95,6 +98,30 @@ bearing, LED mapping, and wraparound, all asserted against the verified
 Python values on every power-up. A translation error surfaces at boot rather
 than in a field test.
 
+## Measured results
+
+First field test on dev-board hardware, 915MHz SF11 (Long Fast), residential
+neighborhood with houses in the signal path:
+
+| Distance | RSSI | SNR | Segment delivery |
+|---|---|---|---|
+| 139 m | −78 dBm | +5.8 dB | — |
+| 288 m | −113 dBm | −8.2 dB | 73% |
+| 390 m | −107 dBm | −1.2 dB | 88% |
+| 635 m | −119 dBm | −13.5 dB | 63% |
+
+- **635 m** confirmed range, inside the design doc's 500–800 m prediction.
+- **SNR was the binding constraint, not signal strength.** SF11 demodulates
+  to about −17.5 dB; far-end readings ranged −13.5 to −18, so this is near the
+  practical limit for the environment rather than where the walk happened to end.
+- **Path loss exponent n ≈ 3.7**, derived from the 200 m and 635 m readings.
+- **11.2 dB body absorption** at a fixed 200 m separation (held clear vs.
+  pressed to chest), projecting ~410 m body-worn. This makes antenna
+  orientation a first-order form-factor constraint.
+- **Position freshness degrades before the link does.** Past ~550 m, gaps
+  between received updates reached 15–25 s against a 10 s transmit cadence —
+  validating the stale-bearing LED state specified months earlier.
+
 ## Engineering notes
 
 A few problems worth documenting, since debugging them was most of the work:
@@ -129,6 +156,21 @@ guessed.
 magnetometer interference from LED ring switching currents. Measured with the
 ring dark versus lit: no detectable shift. Risk closed, and the firmware
 avoids an unnecessary LED-off sampling window.
+
+**Measuring instead of extrapolating.** Rather than treating the design doc's
+500–800 m estimate as a claim to defend, the field test derived a path loss
+exponent (n ≈ 3.7) from two independent readings and used it to project the
+body-worn case, and identified SNR rather than RSSI as the binding constraint
+by comparing measurements against the SF11 demodulation floor. The prediction
+held, but the reasoning is now anchored in measurement rather than the link
+budget alone.
+
+**Quantifying the core design argument.** Choosing sub-GHz LoRa over 2.4 GHz
+rests on water absorbing 2.4 GHz more strongly than 915 MHz. Measuring 11.2 dB
+of loss from a single body turned that cited principle into a number — and
+surfaced an unanticipated constraint, since an 11 dB gap between the outward
+and skin-facing sides of a wristband is a 2× range difference decided purely
+by antenna placement.
 
 ## Roadmap
 

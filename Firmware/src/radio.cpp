@@ -4,6 +4,7 @@
 #include "radio.h"
 #include "gps.h"          // sender stamps its fix in; receiver compares fixes
 #include "navigation.h"   // receiver computes true GPS distance per packet
+#include "mesh.h"         // mesh mode: managed-flooding logic (pure, no radio)
 
 // --- Pins (verified against LilyGo utilities.h, T_BEAM_S3_SUPREME block) ---
 // This is the radio's own SPI bus (FSPI / the global `SPI` object) -- fully
@@ -51,6 +52,20 @@ static uint32_t   txCounter = 0;      // next counter value to send
 static bool       txInFlight = false; // startTransmit() issued, TX-done pending
 static uint32_t   lastTxStart = 0;
 
+#if MESH_MODE
+static MeshNode meshNode;
+static uint32_t nextBeaconAt = 0;
+static bool     txWasRelay   = false;   // what kind of TX is in flight (for stats)
+
+// Next beacon: design-doc cadence with jitter, so three boards booted together
+// don't lock into colliding on air forever. esp_random() is the hardware RNG.
+static void scheduleNextBeacon() {
+    int32_t jitter = (int32_t)(esp_random() % (2 * MESH_BEACON_JITTER_MS + 1))
+                     - MESH_BEACON_JITTER_MS;
+    nextBeaconAt = millis() + MESH_BEACON_MS + jitter;
+}
+#endif
+
 // DIO1 interrupt: just raise a flag. All real work (SPI transfers!) happens in
 // radioTick() -- SPI inside an ISR would collide with whatever transfer the
 // main loop is mid-way through on the other bus.
@@ -88,7 +103,31 @@ bool radioBegin() {
 
     radio.setDio1Action(onDio1);
 
-#if IS_SENDER
+#if MESH_MODE
+    meshInit(meshNode, MESH_DEVICE_ID, MESH_GROUP_ID);
+
+    // Every mesh node listens from the start; TX interleaves when due.
+    state = radio.startReceive();
+    if (state != RADIOLIB_ERR_NONE) {
+        Serial.printf("SX1262 startReceive failed, code %d\n", state);
+        return false;
+    }
+
+    // First beacon soon after boot (small + jittered) so a fresh board
+    // announces itself without three simultaneous boots colliding.
+    nextBeaconAt = millis() + 2000 + (esp_random() % 2000);
+
+    Serial.printf("SX1262 online: MESH NODE %d group %d, %.0fMHz SF%u BW%.0fk\n",
+                  MESH_DEVICE_ID, MESH_GROUP_ID, LORA_FREQ_MHZ, LORA_SF, LORA_BW_KHZ);
+    {
+        const uint8_t blocked[] = MESH_BLOCKED_SENDERS;
+        if (sizeof(blocked) > 0) {
+            Serial.print("MESH: simulating out-of-range for senders:");
+            for (size_t i = 0; i < sizeof(blocked); i++) Serial.printf(" %d", blocked[i]);
+            Serial.println();
+        }
+    }
+#elif IS_SENDER
     Serial.printf("SX1262 online: SENDER, %.0fMHz SF%u BW%.0fk CR4/%u +%ddBm\n",
                   LORA_FREQ_MHZ, LORA_SF, LORA_BW_KHZ, LORA_CR, LORA_TX_DBM);
 #else
@@ -106,10 +145,143 @@ bool radioBegin() {
     return true;
 }
 
+#if MESH_MODE
+// Serialize + hand a packet to the radio. Half-duplex: only ever called when
+// no TX is in flight; the radio implicitly leaves RX mode. Returns whether the
+// transmit started.
+static bool meshTxStart(const MeshPacket &p, bool isRelay) {
+    uint8_t wire[MESH_WIRE_SIZE];
+    meshSerialize(p, wire);
+    int16_t state = radio.startTransmit(wire, MESH_WIRE_SIZE);
+    if (state != RADIOLIB_ERR_NONE) {
+        Serial.printf("MESH: startTransmit failed, code %d\n", state);
+        radio.startReceive();   // fall back to listening rather than going deaf
+        return false;
+    }
+    txInFlight = true;
+    txWasRelay = isRelay;
+    return true;
+}
+
+static const char *meshActionStr(MeshAction a) {
+    switch (a) {
+        case MESH_DROP_BLOCKED:      return "dropped_blocked(sim-range)";
+        case MESH_DROP_FOREIGN:      return "dropped_foreign";
+        case MESH_DROP_DUPLICATE:    return "dropped_duplicate";
+        case MESH_PROCESS_NO_RELAY:  return "processed_no_relay";
+        case MESH_PROCESS_AND_RELAY: return "processed_and_relayed";
+    }
+    return "?";
+}
+#endif
+
 void radioTick() {
     if (!stats.online) return;
 
-#if IS_SENDER
+#if MESH_MODE
+    // ---- 1. Service DIO1 events FIRST, before starting any new TX. The chip's
+    // own IRQ flags say what actually happened (TX_DONE vs RX_DONE) -- more
+    // robust than inferring from our own state, since both events route
+    // through the same pin.
+    if (dio1Flag) {
+        dio1Flag = false;
+        uint32_t irq = radio.getIrqFlags();
+
+        if (txInFlight && (irq & RADIOLIB_SX126X_IRQ_TX_DONE)) {
+            radio.finishTransmit();
+            txInFlight = false;
+            if (txWasRelay) {
+                stats.relayCount++;
+                Serial.println("MESH: TX relay done");
+            } else {
+                stats.txCount++;
+                Serial.printf("MESH: TX beacon done  #%u\n",
+                              (unsigned)(meshNode.nextPacketId - 1));
+            }
+            radio.startReceive();   // half-duplex: straight back to listening
+        } else if (irq & RADIOLIB_SX126X_IRQ_RX_DONE) {
+            uint8_t wire[MESH_WIRE_SIZE] = {0};
+            size_t  len = radio.getPacketLength();
+            int16_t st  = radio.readData(wire, len > sizeof(wire) ? sizeof(wire) : len);
+
+            MeshPacket pkt;
+            if (st == RADIOLIB_ERR_NONE && meshDeserialize(wire, len, pkt)) {
+                float snr  = radio.getSNR();
+                float rssi = radio.getRSSI();
+                MeshAction act = meshHandlePacket(meshNode, pkt, millis());
+
+                Serial.printf("MESH: RX from %u #%u hops %u  %s  RSSI %.1f  SNR %.1f\n",
+                              pkt.senderId, pkt.packetId, pkt.hopLimit,
+                              meshActionStr(act), rssi, snr);
+
+                if (act == MESH_PROCESS_NO_RELAY || act == MESH_PROCESS_AND_RELAY) {
+                    // New information from a group member: update the readout.
+                    stats.rxCount++;
+                    stats.lastCounter  = pkt.packetId;
+                    stats.lastSender   = pkt.senderId;
+                    stats.lastHops     = pkt.hopLimit;
+                    stats.rssi         = rssi;
+                    stats.snr          = snr;
+                    stats.lastRxMillis = millis();
+                    stats.senderHasFix = pkt.fixValid;
+
+                    GpsStatus g = gpsStatus();
+                    stats.distValid = pkt.fixValid && g.valid;
+                    if (stats.distValid) {
+                        stats.distM = distance(g.lat, g.lon,
+                                               pkt.latE7 * 1e-7, pkt.lonE7 * 1e-7);
+                        if (stats.distM > stats.maxDistM) stats.maxDistM = stats.distM;
+                        Serial.printf("MESH: member %u at %.1f m\n",
+                                      pkt.senderId, stats.distM);
+                    }
+                }
+                if (act == MESH_PROCESS_AND_RELAY) {
+                    // Decision says relay; the QUEUE says when (SNR-weighted,
+                    // 200-2000ms). Actual TX happens in step 2 of a later
+                    // pass -- never inline, never blocking.
+                    meshScheduleRelay(meshNode, pkt, snr, millis());
+                }
+                if (act == MESH_DROP_DUPLICATE) {
+                    stats.dupCount++;
+                }
+            } else if (st == RADIOLIB_ERR_CRC_MISMATCH) {
+                stats.crcErrors++;
+                Serial.printf("MESH: RX CRC error (n=%lu)\n",
+                              (unsigned long)stats.crcErrors);
+            } else {
+                Serial.printf("MESH: RX rejected (code %d, len %u)\n",
+                              st, (unsigned)len);
+            }
+            if (!txInFlight) radio.startReceive();   // re-arm
+        } else {
+            // Spurious/other IRQ (e.g. stale flag after a lost race between an
+            // RX completing and a TX starting). Just make sure we're listening.
+            if (!txInFlight) radio.startReceive();
+        }
+    }
+
+    // ---- 2. TX opportunities, only when the radio is idle (half-duplex: a
+    // transmit would stomp a reception in progress; the queue and beacon can
+    // both wait a pass). Due relays outrank the beacon -- forwarding someone
+    // at the network edge matters more than repeating ourselves on schedule.
+    if (!txInFlight) {
+        MeshPacket out;
+        if (meshRelayDue(meshNode, millis(), out)) {
+            Serial.printf("MESH: TX relay of %u #%u (hops left %u)\n",
+                          out.senderId, out.packetId, out.hopLimit);
+            meshTxStart(out, true);
+        } else if ((int32_t)(millis() - nextBeaconAt) >= 0) {
+            GpsStatus g = gpsStatus();
+            int32_t latE7 = g.valid ? (int32_t)llround(g.lat * 1e7) : 0;
+            int32_t lonE7 = g.valid ? (int32_t)llround(g.lon * 1e7) : 0;
+            MeshPacket beacon = meshMakeBeacon(meshNode, latE7, lonE7,
+                                               g.valid, millis());
+            meshTxStart(beacon, false);
+            scheduleNextBeacon();
+        }
+    }
+
+#elif IS_SENDER
     // TX-done: DIO1 fired after a startTransmit(). Clean up, count it.
     if (dio1Flag) {
         dio1Flag = false;

@@ -11,6 +11,7 @@
 #include "ledlogic.h"
 #include "selftest.h"
 #include "radio.h"
+#include "mesh.h"     // MESH_DEVICE_ID for the header line
 
 // WS2812 ring: 16 LEDs, data-in on IO2 (a free S3 GPIO, not a strapping pin).
 #define LED_PIN   2
@@ -64,6 +65,7 @@ void setup() {
     // touching any hardware. Pure math -- needs nothing but serial. A FAIL
     // line here means the port diverged; catch it at boot, not in a field test.
     runSelfTests();
+    runMeshSelfTests();
 
     // Power up the board rails FIRST. The OLED (and GPS, IMU, mag, LoRa) sit
     // on AXP2101-switched 3.3V rails that boot OFF.
@@ -226,7 +228,11 @@ void loop() {
     oledClear();
 
     RadioStats r = radioStats();
-#if IS_SENDER
+#if MESH_MODE
+    // Mesh header: this node's id + own-beacon and processed-packet counts.
+    snprintf(line, sizeof(line), "KANDI N%d T%lu R%lu",
+             MESH_DEVICE_ID, (unsigned long)r.txCount, (unsigned long)r.rxCount);
+#elif IS_SENDER
     snprintf(line, sizeof(line), "KANDI %-4s TX%5lu",
              navValid ? "NAV" : "SRCH", (unsigned long)r.txCount);
 #else
@@ -265,7 +271,36 @@ void loop() {
     }
     oledText(0, 4, line);
 
-#if IS_SENDER
+#if MESH_MODE
+    // Mesh readout: distance to the last-heard group member, link quality,
+    // and mesh activity. Same liveness rule as the range test: AGE counting
+    // up while nothing else changes = that member has gone quiet.
+    if (!r.online) {
+        oledText(0, 5, "RADIO OFFLINE");
+    } else if (r.rxCount == 0) {
+        oledText(0, 5, "D  ----  mx  ----");
+        oledText(0, 6, "RSSI ---   SNR ---");
+        oledText(0, 7, "mesh: listening...");
+    } else {
+        if (r.distValid) {
+            snprintf(line, sizeof(line), "D%6.0fm mx%6.0fm", r.distM, r.maxDistM);
+        } else {
+            snprintf(line, sizeof(line), "D NOFIX  mx%6.0fm", r.maxDistM);
+        }
+        oledText(0, 5, line);
+
+        snprintf(line, sizeof(line), "RSSI%5.0f  SNR%5.1f", r.rssi, r.snr);
+        oledText(0, 6, line);
+
+        // Sxx = who we heard last; hops left in that packet (3 = direct from
+        // them, <3 = it came through a relay); our own relay count; age.
+        uint32_t age = (millis() - r.lastRxMillis) / 1000;
+        snprintf(line, sizeof(line), "S%u h%u rly%lu age%3lus",
+                 r.lastSender, r.lastHops, (unsigned long)r.relayCount,
+                 (unsigned long)age);
+        oledText(0, 7, line);
+    }
+#elif IS_SENDER
     // Accel in m/s^2 to 1dp: at rest one axis should read about +/-9.8 and the
     // other two near 0. Tilt the board and watch gravity move between axes.
     if (haveImu) {
@@ -285,8 +320,16 @@ void loop() {
     oledText(0, 6, line);
 #else
     // Receiver: bottom three pages are the range-test readout (raw sensors
-    // still print to serial).
-    if (r.rxCount > 0) {
+    // still print to serial). Every line always renders -- placeholders
+    // before the first packet -- so a quiet link shows a complete, obviously
+    // waiting layout instead of a suspicious blank screen.
+    if (!r.online) {
+        oledText(0, 5, "RADIO OFFLINE");
+    } else if (r.rxCount == 0) {
+        oledText(0, 5, "D  ----  mx  ----");
+        oledText(0, 6, "RSSI ---   SNR ---");
+        oledText(0, 7, "RX 0  listening...");
+    } else {
         // Distance to sender now + the farthest a packet has ever made it.
         // Max is held on screen even after the link dies -- that's the result
         // of the range test.
@@ -308,16 +351,15 @@ void loop() {
                  (unsigned long)r.rxCount, (unsigned long)(r.lastCounter + 1),
                  (unsigned long)age);
         oledText(0, 7, line);
-    } else {
-        oledText(0, 5, r.online ? "PKT --  listening" : "RADIO OFFLINE");
     }
 #endif
 
-#if IS_SENDER
+#if IS_SENDER && !MESH_MODE
     // Nav summary on the bottom page: distance, absolute bearing to target,
     // relative bearing, and which logical LED is lit. Cross-checks the ring.
-    // (The receiver uses page 7 for link liveness instead -- during a range
-    // test its screen belongs to the radio.)
+    // (The receiver and mesh modes use page 7 for link liveness instead --
+    // during radio testing the screen belongs to the radio. The waypoint
+    // pointer still runs on the ring in every mode.)
     if (navValid) {
         snprintf(line, sizeof(line), "T%5.0fm B%03.0f R%03.0f L%d",
                  distM, targetBrg, relBrg, pointerLed);

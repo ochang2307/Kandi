@@ -17,7 +17,16 @@
 // 915 MHz, SF11, 250 kHz, CR 4/5, +14 dBm. Do not tune them for range or
 // speed -- the mesh math (airtime, relay delays) is built around this preset.
 
-// --- Role toggle ---
+// --- Mode toggle ---
+// MESH_MODE 1: every board is a symmetric mesh node -- beacons its own
+// position (design-doc cadence), listens continuously, and relays per
+// mesh.cpp's managed-flooding rules. Per-board identity comes from
+// MESH_DEVICE_ID / MESH_BLOCKED_SENDERS in mesh.h -- set those before
+// flashing each board.
+// MESH_MODE 0: the older two-board range test (IS_SENDER picks the role).
+#define MESH_MODE 1
+
+// --- Role toggle (range test only; ignored when MESH_MODE=1) ---
 // 1 = this board transmits a counter packet every 3s.
 // 0 = this board listens continuously and reports what it hears.
 // Flash one board with each; everything else is identical.
@@ -42,6 +51,14 @@ struct RadioStats {
     bool     distValid;      // both sides had a fix; distM/maxDistM updated
     double   distM;          // GPS distance to sender at the newest packet
     double   maxDistM;       // farthest distance a packet has ever arrived from
+
+    // Mesh mode. txCount above becomes "own beacons sent"; rxCount becomes
+    // "packets processed" (new information -- duplicates/blocked/foreign are
+    // serial-logged but not counted here).
+    uint32_t relayCount;     // relays actually transmitted (not just scheduled)
+    uint32_t dupCount;       // duplicates heard (each one is flooding working)
+    uint8_t  lastSender;     // device id the newest processed packet came from
+    uint8_t  lastHops;       // hop limit REMAINING in that packet (3 = direct)
 };
 
 // Bring up SPI + the SX1262 and configure the Long Fast preset. Returns false
