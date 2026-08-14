@@ -35,8 +35,17 @@ requires a phone app. Apple's offline finding only works at ~10-30m.
 - ✅ **First field validation.** 635 m link range through residential
   obstruction against a 500–800 m link-budget prediction; body absorption
   measured at 11.2 dB.
-- 🔄 **In progress:** magnetometer hard-iron calibration, porting the mesh
-  protocol to firmware, and the two-device demo.
+- ✅ **Mesh protocol on hardware.** Managed flooding ported to firmware and
+  verified on a three-board desk topology with simulated out-of-range links:
+  positions crossing a gap via relay, duplicate suppression terminating the
+  flood, hop limits enforced, and SNR-weighted relay delay (edge nodes relay
+  first, redundant relays cancel on overhearing a duplicate).
+- ✅ **Magnetometer calibration.** Hard-iron capture with live per-axis
+  coverage feedback, offsets persisted to NVS per board. Corrected field
+  magnitude holds 46–56 µT through full rotation on all three boards — against
+  a raw hard-iron offset ~5× Earth's field.
+- 🔄 **In progress:** the two-device "find your friend" demo — pointing the
+  LED ring at a live mesh member instead of a fixed waypoint.
 
 ## Hardware
 
@@ -90,12 +99,16 @@ synthetic sensor vectors, real LoRa transmit replaces a simulated one).
 | `compass.cpp` | Ported tilt-compensated compass, running on live sensor data |
 | `navigation.cpp` | Ported haversine distance + bearing |
 | `ledlogic.cpp` | Ported bearing → LED index mapping |
-| `radio.cpp` | SX1262 LoRa via RadioLib, non-blocking (interrupt-driven) |
+| `radio.cpp` | SX1262 LoRa via RadioLib, non-blocking (interrupt-driven), mesh + range-test modes |
+| `mesh.cpp` | Ported managed-flooding mesh: deterministic wire format, fixed-size seen cache with expiry, SNR-weighted scheduled relay queue |
+| `calibration.cpp` | Magnetometer hard-iron capture with live coverage UI, offsets persisted in NVS |
 
 Every ported module ships with the **original Python test vectors as
-boot-time self-tests** — 19 cases covering distance, bearing, relative
-bearing, LED mapping, and wraparound, all asserted against the verified
-Python values on every power-up. A translation error surfaces at boot rather
+boot-time self-tests** — 38 cases across two suites: distance, bearing,
+relative bearing, LED mapping, and wraparound asserted against the verified
+Python values, plus the mesh flooding scenarios (relay across a gap, loop
+termination via dedup, hop-limit expiry) re-run against in-memory device
+instances on every power-up. A translation error surfaces at boot rather
 than in a field test.
 
 ## Measured results
@@ -152,6 +165,16 @@ heading stayed trapped in a 9° band. Diagnosing this quantitatively, before
 writing any calibration, meant the calibration target was known rather than
 guessed.
 
+**Simulating "out of range" taught a protocol lesson.** To force multi-hop on
+a desk where all three boards hear each other, each board can be built with a
+list of node IDs it pretends not to hear. The first implementation filtered on
+the packet's *originator* — which also silently discarded relayed copies of
+that originator's packets, the exact traffic the test existed to observe. The
+fix distinguishes the frame's transmitter from the packet's originator on the
+wire, because radio range is a property of who is on the air, not whose data
+is inside. The desk test then showed positions crossing the simulated gap
+with one hop consumed.
+
 **Retiring a risk with measurement.** The design doc flagged possible
 magnetometer interference from LED ring switching currents. Measured with the
 ring dark versus lit: no detectable shift. Risk closed, and the firmware
@@ -174,6 +197,6 @@ by antenna placement.
 
 ## Roadmap
 
-Magnetometer calibration → mesh protocol on hardware → two-device
-"find your friend" field demo → miniaturized integrated unit → wrist form
-factor → scaled field testing at progressively larger events.
+Two-device "find your friend" field demo (ring points at a live mesh member)
+→ three-board relay demo at real range → miniaturized integrated unit →
+wrist form factor → scaled field testing at progressively larger events.

@@ -5,6 +5,7 @@
 #include "gps.h"          // sender stamps its fix in; receiver compares fixes
 #include "navigation.h"   // receiver computes true GPS distance per packet
 #include "mesh.h"         // mesh mode: managed-flooding logic (pure, no radio)
+#include "roster.h"       // mesh mode: last-known position per member
 
 // --- Pins (verified against LilyGo utilities.h, T_BEAM_S3_SUPREME block) ---
 // This is the radio's own SPI bus (FSPI / the global `SPI` object) -- fully
@@ -210,8 +211,8 @@ void radioTick() {
                 float rssi = radio.getRSSI();
                 MeshAction act = meshHandlePacket(meshNode, pkt, millis());
 
-                Serial.printf("MESH: RX from %u #%u hops %u  %s  RSSI %.1f  SNR %.1f\n",
-                              pkt.senderId, pkt.packetId, pkt.hopLimit,
+                Serial.printf("MESH: RX from %u via %u #%u hops %u  %s  RSSI %.1f  SNR %.1f\n",
+                              pkt.senderId, pkt.txNode, pkt.packetId, pkt.hopLimit,
                               meshActionStr(act), rssi, snr);
 
                 if (act == MESH_PROCESS_NO_RELAY || act == MESH_PROCESS_AND_RELAY) {
@@ -233,6 +234,14 @@ void radioTick() {
                         if (stats.distM > stats.maxDistM) stats.maxDistM = stats.distM;
                         Serial.printf("MESH: member %u at %.1f m\n",
                                       pkt.senderId, stats.distM);
+                    }
+
+                    // Feed the roster -- only with real positions. A no-fix
+                    // beacon must NOT overwrite a member's last-known spot;
+                    // their entry just ages, which is what drives the
+                    // stale/lost ring states.
+                    if (pkt.fixValid && pkt.msgType == MESH_MSG_POSITION) {
+                        rosterUpdate(pkt.senderId, pkt.latE7, pkt.lonE7, millis());
                     }
                 }
                 if (act == MESH_PROCESS_AND_RELAY) {

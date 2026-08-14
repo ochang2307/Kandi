@@ -1,15 +1,16 @@
 #include <string.h>
 #include "mesh.h"
 
-static const char MESH_MAGIC[4] = {'K', 'N', 'D', 'M'};
+// Version char bumped M -> N when the tx_node byte was added (18 -> 19 bytes).
+static const char MESH_MAGIC[4] = {'K', 'N', 'D', 'N'};
 
 // The per-build blocked list. The define expands to an initializer list; an
 // empty one makes a zero-length array, which sizeof handles fine.
 static const uint8_t BLOCKED[] = MESH_BLOCKED_SENDERS;
 
-bool meshSenderBlocked(uint8_t senderId) {
+bool meshSenderBlocked(uint8_t nodeId) {
     for (size_t i = 0; i < sizeof(BLOCKED); i++) {
-        if (BLOCKED[i] == senderId) return true;
+        if (BLOCKED[i] == nodeId) return true;
     }
     return false;
 }
@@ -57,6 +58,7 @@ size_t meshSerialize(const MeshPacket &p, uint8_t buf[MESH_WIRE_SIZE]) {
     putI32(&buf[9],  p.latE7);
     putI32(&buf[13], p.lonE7);
     buf[17] = p.fixValid ? 0x01 : 0x00;
+    buf[18] = p.txNode;
     return MESH_WIRE_SIZE;
 }
 
@@ -71,6 +73,7 @@ bool meshDeserialize(const uint8_t *buf, size_t len, MeshPacket &out) {
     out.latE7    = getI32(&buf[9]);
     out.lonE7    = getI32(&buf[13]);
     out.fixValid = (buf[17] & 0x01) != 0;
+    out.txNode   = buf[18];
     return true;
 }
 
@@ -158,6 +161,7 @@ bool meshRelayDue(MeshNode &node, uint32_t nowMs, MeshPacket &out) {
         PendingRelay &r = node.relayQueue[i];
         if (r.active && (int32_t)(nowMs - r.dueAtMs) >= 0) {
             out = r.pkt;
+            out.txNode = node.deviceId;   // we're about to be the transmitter
             r.active = false;
             return true;
         }
@@ -182,7 +186,11 @@ bool meshRelayDue(MeshNode &node, uint32_t nowMs, MeshPacket &out) {
 // instantaneous); with real 200-2000ms relay delays, a duplicate arriving
 // mid-wait is exactly the signal that our relay became redundant.
 MeshAction meshHandlePacket(MeshNode &node, const MeshPacket &pkt, uint32_t nowMs) {
-    if (meshSenderBlocked(pkt.senderId)) {
+    // Blocked check keys on the TRANSMITTER, not the originator: it simulates
+    // RF range, and a relayed copy arrives from the relayer's radio, not the
+    // originator's. (Filtering on senderId here would also kill relayed
+    // copies -- the exact thing the desk multi-hop test needs to see.)
+    if (meshSenderBlocked(pkt.txNode)) {
         return MESH_DROP_BLOCKED;
     }
     if (pkt.groupId != node.groupId) {
@@ -213,6 +221,7 @@ MeshPacket meshMakeBeacon(MeshNode &node, int32_t latE7, int32_t lonE7,
     p.latE7    = latE7;
     p.lonE7    = lonE7;
     p.fixValid = fixValid;
+    p.txNode   = node.deviceId;   // on a fresh beacon, originator == transmitter
 
     // network.py originate(): mark our own packet seen so a copy that comes
     // back via someone's relay is dropped, not re-processed and re-flooded.

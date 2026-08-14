@@ -111,8 +111,10 @@ These cost real debugging time during OLED bring-up. Firmware lives in
 `oled.cpp`/`oled.h` (display), `gps.cpp`/`gps.h` (GNSS), `imu.cpp`/`imu.h`
 (QMI8658), `mag.cpp`/`mag.h` (QMC6310N), `radio.cpp`/`radio.h` (SX1262 LoRa).
 Ported core logic (hardware-free, mirrors `CoreLogic/`): `compass.cpp`/`.h`,
-`navigation.cpp`/`.h`, `ledlogic.cpp`/`.h`, with `selftest.cpp`/`.h` running
-the ported logic against Python golden values at boot.
+`navigation.cpp`/`.h`, `ledlogic.cpp`/`.h`, `mesh.cpp`/`.h`, with
+`selftest.cpp`/`.h` + `mesh_test.cpp` running the ported logic against Python
+golden values / network.py scenarios at boot. `calibration.cpp`/`.h` is the
+mag hard-iron calibration (serial-command driven, NVS-persisted).
 
 **Power-on order: init the PMU FIRST.** The AXP2101 gates every peripheral
 3.3V rail, and they boot OFF. The ESP32 itself runs from an always-on rail
@@ -257,15 +259,45 @@ that samples both sensors and runs the pipeline.
   re-read. `imuRead()` gates on a data-ready flag, so a second immediate call
   comes back empty — reading once and passing the samples out avoids a
   perpetually dead heading. main.cpp relies on this.
-- **Hard-iron offsets are placeholders (`magOffsetX/Y/Z`, extern, = 0).**
-  Subtracted in the sensor frame *before* rotation. Until the figure-eight
-  calibration fills them in, heading is badly biased and barely moves (the
-  ~250 µT offset dwarfs the ~20 µT horizontal signal — see the baseline
-  reading notes above). This is expected, not a bug. Calibration is the
-  remaining piece of milestone 3.
+- **Hard-iron offsets (`magOffsetX/Y/Z`, extern) are populated at boot** by
+  `calBegin()` from NVS — see the calibration block below. Subtracted in the
+  sensor frame *before* rotation. On a board with no stored calibration they
+  stay zero and heading is badly biased and barely moves (the ~250 µT offset
+  dwarfs the ~20 µT horizontal signal) — the OLED flag shows `---` in that
+  state.
 - Verified: the actual `compass.cpp` compiles on the host against a stub
   `Arduino.h` and passes the same 26-case round-trip as `compass_test.py` at
   err=0.0000. Links the real firmware source, not a copy.
+
+**Hard-iron calibration (`calibration.cpp`/`.h`).** DONE on all 3 boards
+(2026-08). Min/max per axis over a 30s capture, center = (max+min)/2; soft
+iron (ellipsoid distortion) deliberately NOT corrected in v1. Serial commands
+into the pio monitor: `cal` starts a capture, `calclear` wipes it.
+- **Offsets persist in NVS** (Preferences, namespace "kandi") — they survive
+  reboot AND reflash (own flash partition). Loaded at boot by `calBegin()`
+  into compass.cpp's `magOffsetX/Y/Z`; compass.cpp itself was not touched.
+- **Per-board data, same firmware.** Hard iron differs board to board; each
+  board stores its own numbers. A new board (or after `calclear`) needs its
+  own 30s capture.
+- **The validation signal is |M| on the HDG line** (`HDG 234.5 M 48 CAL`):
+  magnitude of the corrected field. Good calibration = ~25–65 µT and steady
+  at ANY orientation (measured 46–56 on these boards). Swinging with
+  orientation = bad coverage, redo. Near a laptop it legitimately reads
+  70–95+ — that's the laptop's field, not a calibration failure; it's why
+  the number is on screen. `CAL`/`---` flag = whether stored offsets are
+  loaded, i.e. whether heading deserves any trust.
+- **Capture technique:** figure-eights are not enough — FLIP the board over
+  mid-capture or ±Z never sees both extremes. The OLED shows per-axis spread
+  live with `LOW <-` marking the lagging axis; each axis wants ~100 µT
+  (2× Earth's field). Keep the board an arm's length from the laptop during
+  capture (its lid magnet bakes into the offsets and walks away afterward).
+- **Recalibrate after any hardware change near the mag** — and calibrate in
+  the configuration the board runs in: an 18650 in the holder is a large
+  hard-iron contributor, so battery-in vs battery-out are different
+  calibrations.
+- Capture reads RAW mag (offsets only apply inside `compassHeading()`), so
+  re-running `cal` on a calibrated board can't double-subtract. Capture is
+  non-blocking (~0.2ms I2C read per loop pass); it only takes over the OLED.
 
 **Navigation (`navigation.cpp`/`.h`) + LED logic (`ledlogic.cpp`/`.h`).**
 Direct ports of `navigation.py` and `LEDLogic.py`.
@@ -406,19 +438,30 @@ formulaic writing.
      baseline sensor values mean.
 3. Port compass to C++; add hard-iron calibration routine (figure-eight
    capture) — this is new work, not ported, and needs real mag data.
-   — PARTIAL: compass ported (`compass.cpp`, host round-trip verified).
-     Figure-eight calibration NOT done — offsets are still zero placeholders,
-     so live headings are badly biased. This is the remaining work here.
+   — DONE (2026-08): compass ported + `calibration.cpp` (min/max capture,
+     NVS-persisted). All 3 boards calibrated; |M| holds 46–56 µT through
+     rotation on each. Headings are live and trustworthy away from large
+     metal/electronics. See the calibration block in the firmware notes.
 4. Port navigation + LED logic (direct translation of the Python).
    — DONE: `navigation.cpp` + `ledlogic.cpp`, boot self-tests against Python
      golden values (`selftest.cpp`), and wired to the physical ring (pointer
      vs searching states) with a test waypoint.
 5. LoRa link: two boards exchanging position packets (port mesh.py logic;
    real SX1262 TX/RX replaces transmit() placeholder).
-   — LINK DONE: `radio.cpp`, non-blocking SX1262 TX/RX, versioned position
-     packet (counter + lat/lon + fix flag), range-test readout (distance,
-     RSSI/SNR, packet-age, max-distance, drop gaps). Still TODO: port the
-     actual `mesh.py` logic (dedup cache, hop-limit, relay) on top of the raw
-     link, and the SNR-weighted relay delay.
+   — DONE, desk-verified on 3 boards (2026-08). `radio.cpp` (non-blocking
+     SX1262, versioned wire format) + `mesh.cpp`/`mesh.h` (managed flooding:
+     32-slot seen cache w/ 30s expiry, hop limits, SNR-weighted relay queue
+     200-2000ms, duplicate-cancels-relay) + `mesh_test.cpp` (network.py
+     scenarios as boot self-tests). MESH_BLOCKED_SENDERS in mesh.h simulates
+     out-of-range per board — filters on the tx_node byte (the TRANSMITTER),
+     not the originator; blocking the originator would kill relayed copies
+     too (that bug happened; wire format bumped KNDM->KNDN adding tx_node).
+     Verified: line topology 1<->2<->3 on a desk, `S1 h2`/`S3 h2` on the end
+     boards' OLEDs = positions crossing the simulated gap via board 2, dedup
+     holding R at ~2x T. OLED `h` = hops REMAINING (3 = direct, 2 = one
+     relay). Known desk artifact: point-blank SNR clamps all relay delays to
+     2000ms, so end-board relays sometimes collide (small R loss); real SNR
+     spread or added jitter fixes it.
 6. Integration: device_tick on hardware — board A's ring points at board B.
-7. Park field test + demo video. Then third board for mesh relay testing.
+7. Park field test + demo video. Then third board for mesh relay testing
+   (desk-verified already; the park run re-proves it at real range).

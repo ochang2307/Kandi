@@ -59,6 +59,21 @@ HorizontalField tiltCompensate(float mx, float my, float mz,
 // Level-frame components -> heading in degrees, 0-360, 0 = north.
 float headingFrom(float Xh, float Yh);
 
+// --- Magnetic declination ---
+// The magnetometer measures against MAGNETIC north; bearing() in
+// navigation.cpp works in TRUE north (great-circle math on GPS coordinates).
+// Mixing the two references puts a constant angular error on every LED
+// indication, so compassHeading() adds this correction as its final step.
+//
+// LOCATION-SPECIFIC: 13.0 deg East is Saratoga / SF Bay Area. East
+// declination is positive (magnetic north sits east of true north here, so
+// true = magnetic + declination). CHANGE THIS if the device is tested
+// anywhere else -- and note declination also drifts a fraction of a degree
+// per year as the pole wanders. A production device would derive it from the
+// GPS fix via a lookup (the WMM model, or a coarse per-region table) instead
+// of hardcoding.
+static const float MAGNETIC_DECLINATION_DEG = 13.0f;
+
 // One full pipeline pass: sample both sensors, apply the hard-iron offsets,
 // and return the heading. Non-blocking -- if either sensor has no fresh sample
 // this returns with ok = false rather than waiting (the GPS UART overruns if
@@ -71,7 +86,10 @@ struct CompassData {
     bool  ok;          // true only when both sensors gave a fresh sample
     bool  haveImu;
     bool  haveMag;
-    float heading;     // degrees, 0-360, 0 = north       (valid only if ok)
+    float heading;     // TRUE-north heading, declination applied -- use this
+                       //   against bearing(). degrees 0-360 (valid only if ok)
+    float headingMag;  // MAGNETIC heading, straight from headingFrom() --
+                       //   display/diagnostics only  (valid only if ok)
     float pitchDeg;    // degrees, for display/diagnostics (valid only if ok)
     float rollDeg;     // degrees, for display/diagnostics (valid only if ok)
     ImuData imu;       // the accel/gyro sample used

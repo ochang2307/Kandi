@@ -12,25 +12,39 @@
 #include "selftest.h"
 #include "radio.h"
 #include "mesh.h"     // MESH_DEVICE_ID for the header line
+#include "calibration.h"
+#include "roster.h"
 
 // WS2812 ring: 16 LEDs, data-in on IO2 (a free S3 GPIO, not a strapping pin).
 #define LED_PIN   2
 #define NUM_LEDS  16
 CRGB leds[NUM_LEDS];       // pixel buffer; edits here do nothing until FastLED.show()
 
-// --- Test waypoint (edit these to move the target) ---
-// ~100m due north of 20090 Glasgow Dr: verified with the ported haversine as
-// 100.1m / bearing 360.0 from the front door. Stand at the house and the top
-// LED pair should light when the board points north.
+// --- Test waypoint (range-test builds only; MESH_MODE navigates to a live
+// mesh member from the roster instead) ---
 #define TARGET_LAT 37.276481
 #define TARGET_LON -122.024791
 
-// Ring display state. The 1s nav tick DECIDES (mode + which logical LED), the
-// fast render tick below DRAWS. Split so the no-fix pulse can breathe smoothly
-// at ~40fps without the nav math running any faster than 1Hz.
-enum RingMode { RING_SEARCHING, RING_POINTING };
-RingMode ringMode   = RING_SEARCHING;
-int      pointerLed = 0;   // logical sector 0-7 (0 = top), valid when POINTING
+// BOOT button (IO0). Only input we have; used to cancel the arrival flash.
+#define BUTTON_PIN 0
+
+// Ring display state, per the design doc's LED UX. The 1s nav tick DECIDES
+// (mode + which logical LED + blink rate), the fast ~25ms render tick DRAWS,
+// so blinks and breathing stay smooth while the nav math runs at 1Hz.
+enum RingMode {
+    RING_NO_FIX,          // no own GPS fix: blue breathing pulse at top
+    RING_LOST,            // no member heard / >120s silent: magenta slow
+                          //   breathing at top -- NOT a bearing
+    RING_NAVIGATING,      // live bearing: LED pair blinking, rate = distance
+    RING_STALE,           // >30s-old bearing: same pair, dim breathing --
+                          //   "remembered, not live" must read differently
+    RING_ARRIVED_FLASH,   // <10m, first ~8s: whole ring flashing
+    RING_ARRIVED_STEADY,  // <10m after the flash (or button): steady pair
+    RING_POINTING,        // range-test builds: steady pair at the waypoint
+};
+RingMode ringMode    = RING_NO_FIX;
+int      pointerLed  = 0;     // logical sector 0-7 (0 = top)
+uint32_t blinkHalfMs = 800;   // NAVIGATING blink half-period (on time = off time)
 
 bool imuOk = false;        // did the IMU answer its chip-ID read at boot?
 bool magOk = false;        // ditto for the magnetometer
@@ -38,20 +52,63 @@ bool magOk = false;        // ditto for the magnetometer
 // Draw the current ring state. Called every ~25ms from loop().
 //
 // This is the display layer, so the logical->physical mapping lives HERE, not
-// in ledForBearing(): logical sector s (45 deg wide, 0 = top, clockwise) lights
-// physical pair {2s, 2s+1} on the 16-LED ring. That assumes physical LED 0 sits
-// at 12 o'clock with indices running clockwise -- if the ring ends up mounted
-// rotated, fix it in this function with an offset, never in the logic.
+// in ledForBearing(): logical sector s (45 deg wide, 0 = top, clockwise)
+// lights physical pair {2s, 2s+1} on the 16-LED ring (the "single LED" of the
+// 8-sector model). Assumes physical LED 0 at 12 o'clock, indices clockwise --
+// if the ring mounts rotated, fix it here with an offset, never in the logic.
+//
+// Color notes: navigation is blue for now (member colors come with bonding).
+// Yellow and green are RESERVED (battery/charging, design doc). LOST uses
+// magenta so it can never be confused with the blue NO_FIX pulse -- both sit
+// at the top pixel, and "no GPS" vs "no friend" need different answers.
+static void setPair(int sector, const CRGB &c) {
+    leds[(sector * 2)     % NUM_LEDS] = c;
+    leds[(sector * 2 + 1) % NUM_LEDS] = c;
+}
+
 static void renderRing() {
     FastLED.clear();
-    if (ringMode == RING_POINTING) {
-        leds[(pointerLed * 2)     % NUM_LEDS] = CRGB(0, 0, 120);
-        leds[(pointerLed * 2 + 1) % NUM_LEDS] = CRGB(0, 0, 120);
-    } else {
-        // Searching: one pixel at the top breathing on a ~2s triangle wave.
-        // Unmistakably different from the steady two-pixel pointer.
-        uint8_t breath = triwave8((uint8_t)(millis() / 8));   // 256 steps x 8ms
-        leds[0] = CRGB(0, 0, scale8(breath, 120));
+    uint32_t now = millis();
+
+    switch (ringMode) {
+        case RING_NO_FIX: {
+            // ~2s blue breathing at the top pixel.
+            uint8_t b = triwave8((uint8_t)(now / 8));
+            leds[0] = CRGB(0, 0, scale8(b, 120));
+            break;
+        }
+        case RING_LOST: {
+            // Slower (~4s) magenta breathing at the top pixel. Not a bearing.
+            uint8_t b = triwave8((uint8_t)(now / 16));
+            leds[0] = CRGB(scale8(b, 100), 0, scale8(b, 100));
+            break;
+        }
+        case RING_NAVIGATING: {
+            // Blink at the distance-bucket rate (device.py blink_rate_for).
+            if ((now / blinkHalfMs) % 2 == 0) setPair(pointerLed, CRGB(0, 0, 120));
+            break;
+        }
+        case RING_STALE: {
+            // Same bearing, but dim breathing instead of a crisp blink:
+            // "this is where they WERE." Field-measured 15-25s update gaps
+            // at range make this state common, not exceptional.
+            uint8_t b = triwave8((uint8_t)(now / 8));
+            setPair(pointerLed, CRGB(0, 0, scale8(b, 70)));
+            break;
+        }
+        case RING_ARRIVED_FLASH: {
+            // Whole ring, fast flash. Power is fine: global brightness 25 +
+            // the 500mA FastLED cap stay in force.
+            if ((now / 150) % 2 == 0) {
+                for (int i = 0; i < NUM_LEDS; i++) leds[i] = CRGB(0, 0, 120);
+            }
+            break;
+        }
+        case RING_ARRIVED_STEADY:
+        case RING_POINTING: {
+            setPair(pointerLed, CRGB(0, 0, 120));
+            break;
+        }
     }
     FastLED.show();
 }
@@ -143,6 +200,15 @@ void setup() {
     magOk = magBegin();
     Serial.println(magOk ? "MAG  chip ID OK" : "MAG  chip ID FAILED (no response)");
 
+    // BOOT button: cancels the arrival flash. IO0 is a strapping pin but is
+    // exactly the on-board button, safe as an input after boot.
+    pinMode(BUTTON_PIN, INPUT_PULLUP);
+
+    // Load stored hard-iron offsets (NVS) into compass.cpp's magOffsetX/Y/Z.
+    // Prints whether a calibration exists -- without one the heading is biased
+    // by ~250uT of board hard iron and the OLED flag shows "---".
+    calBegin();
+
     // --- LoRa (additive) ---
     // ALDO3 rail is already up from initBoardPower(). The radio claims the
     // global SPI bus (FSPI, 12/13/11) -- the IMU deliberately uses its own
@@ -167,6 +233,10 @@ void loop() {
     // blocks, all airtime happens inside the SX1262 behind the DIO1 interrupt.
     radioTick();
 
+    // Calibration: serial commands ('cal' / 'calclear') + capture sampling.
+    // Non-blocking, one I2C read per pass at most.
+    calTick();
+
     // Fast render tick: redraw the ring every ~25ms so the searching pulse
     // breathes smoothly. Costs ~0.5ms per frame over RMT (non-blocking for
     // I2C/interrupts), nowhere near the 250ms GPS overrun budget.
@@ -181,6 +251,42 @@ void loop() {
     lastTick = millis();
 
     // --- everything below runs once per second ---
+
+    // Calibration capture owns the whole screen while it runs: the ONLY thing
+    // that matters during those 30s is which axis still needs coverage. Each
+    // axis must see both extremes of Earth's field, so its spread needs to
+    // reach ~100 uT (2 x ~50 uT) -- an axis stuck at "LOW" is the one you
+    // haven't rotated through the vertical yet.
+    {
+        CalStatus cs = calStatus();
+        if (cs.active) {
+            char cline[24];
+            oledClear();
+            snprintf(cline, sizeof(cline), "CALIBRATING     %2lus",
+                     (unsigned long)((cs.msRemaining + 999) / 1000));
+            oledText(0, 0, cline);
+            oledText(0, 1, "rotate ALL axes");
+
+            struct { const char *n; float v; } ax[3] = {
+                {"X", cs.spreadX}, {"Y", cs.spreadY}, {"Z", cs.spreadZ}
+            };
+            for (int i = 0; i < 3; i++) {
+                const char *verdict = ax[i].v >= 100.0f ? "OK"
+                                    : ax[i].v >= 50.0f  ? "..."
+                                    :                     "LOW <-";
+                snprintf(cline, sizeof(cline), "%s %4.0fuT  %s",
+                         ax[i].n, ax[i].v, verdict);
+                oledText(0, 3 + i, cline);
+            }
+            oledText(0, 7, "fig-8 then flip it");
+            oledShow();
+
+            Serial.printf("CAL: %2lus left  spread X %.0f  Y %.0f  Z %.0f uT\n",
+                          (unsigned long)(cs.msRemaining / 1000),
+                          cs.spreadX, cs.spreadY, cs.spreadZ);
+            return;   // normal readout resumes when the capture ends
+        }
+    }
 
     GpsStatus g = gpsStatus();
 
@@ -205,13 +311,78 @@ void loop() {
         haveHeading = true;
     }
 
-    // --- Navigation: current fix -> target, through the ported core logic ---
+    // --- Navigation, through the ported core logic ---
     // distance()/bearing() are the haversine pair, then relativeBearing()
     // subtracts where the device points, then ledForBearing() buckets into the
-    // 8 logical sectors. Exactly the Python pipeline, on live data.
+    // 8 logical sectors. Exactly the Python pipeline (device.py's per-member
+    // loop, single-target for now), on live data.
     double distM = 0.0, targetBrg = 0.0;
     float  relBrg = 0.0f;
-    bool   navValid = g.valid && haveHeading;
+    bool   navValid = false;
+
+#if MESH_MODE
+    // Target = most recently heard mesh member with a real position.
+    RosterEntry tgt;
+    bool haveTgt = rosterMostRecent(tgt);
+    uint32_t tgtAgeS = 0;
+    uint8_t  tgtId = 0;
+
+    // Arrival flash bookkeeping: flash for ~8s on ENTERING arrived, then
+    // decay to steady. The BOOT button cancels the flash early.
+    static bool     wasArrived = false;
+    static uint32_t arrivedFlashUntil = 0;
+
+    if (!g.valid) {
+        ringMode = RING_NO_FIX;
+        wasArrived = false;
+    } else if (!haveTgt) {
+        ringMode = RING_LOST;   // fix but no member ever heard: nothing to point at
+        wasArrived = false;
+    } else {
+        tgtId   = tgt.id;
+        tgtAgeS = (millis() - tgt.lastUpdateMs) / 1000;
+        distM     = distance(g.lat, g.lon, tgt.latE7 * 1e-7, tgt.lonE7 * 1e-7);
+        targetBrg = bearing(g.lat, g.lon, tgt.latE7 * 1e-7, tgt.lonE7 * 1e-7);
+        if (haveHeading) {
+            relBrg     = relativeBearing((float)targetBrg, lastHeading);
+            pointerLed = ledForBearing(relBrg);
+        }
+        navValid = haveHeading;
+
+        // State by freshness FIRST, then distance. A 40s-old position can't
+        // credibly claim "arrived" -- staleness gates everything. Thresholds:
+        // 30s stale / 120s lost; field testing measured 15-25s honest gaps at
+        // range, so stale must read as "normal at distance", not as failure.
+        if (tgtAgeS > 120) {
+            ringMode = RING_LOST;
+            wasArrived = false;
+        } else if (tgtAgeS > 30) {
+            ringMode = RING_STALE;
+            wasArrived = false;
+        } else if (distM < 10.0) {
+            if (!wasArrived) {                       // entering arrived: flash
+                wasArrived = true;
+                arrivedFlashUntil = millis() + 8000;
+            }
+            ringMode = (millis() < arrivedFlashUntil) ? RING_ARRIVED_FLASH
+                                                      : RING_ARRIVED_STEADY;
+        } else {
+            wasArrived = false;
+            ringMode = RING_NAVIGATING;
+            // device.py blink_rate_for(): <50m fast, <200m medium, else slow.
+            blinkHalfMs = distM < 50.0 ? 150 : distM < 200.0 ? 400 : 800;
+        }
+    }
+
+    // BOOT button cancels the arrival flash (checked here at 1Hz is enough --
+    // a human press spans several ticks).
+    if (ringMode == RING_ARRIVED_FLASH && digitalRead(BUTTON_PIN) == LOW) {
+        arrivedFlashUntil = 0;
+        ringMode = RING_ARRIVED_STEADY;
+    }
+#else
+    // Range-test builds: fixed waypoint, steady pointer (original behavior).
+    navValid = g.valid && haveHeading;
     if (navValid) {
         distM     = distance(g.lat, g.lon, TARGET_LAT, TARGET_LON);
         targetBrg = bearing(g.lat, g.lon, TARGET_LAT, TARGET_LON);
@@ -219,8 +390,9 @@ void loop() {
         pointerLed = ledForBearing(relBrg);
         ringMode   = RING_POINTING;
     } else {
-        ringMode = RING_SEARCHING;
+        ringMode = RING_NO_FIX;
     }
+#endif
 
     // Stack GPS, compass, sensor, and nav state on the OLED. Lines are kept
     // under 21 chars -- that's the 5x7 font's limit across 128px.
@@ -260,40 +432,64 @@ void loop() {
         oledText(0, 3, line);
     }
 
-    // Heading, tilt-compensated, degrees clockwise from north. Pitch and roll
-    // ride alongside it so a heading that looks wrong can be checked against the
-    // tilt it was derived from.
+    // Heading + the calibration validation pair. M is |corrected field| --
+    // THE post-calibration check: it should sit at ~25-65 uT and stay put at
+    // any orientation. If it swings as you rotate, the offsets are wrong (or
+    // something ferrous moved near the board). CAL/--- flags whether stored
+    // offsets are loaded, i.e. whether the heading deserves any trust.
+    // (Pitch/roll moved to serial-only -- the CMP line still has them.)
+    float magNorm = 0;
+    if (haveMag) {
+        float cmx = m.mx - magOffsetX;
+        float cmy = m.my - magOffsetY;
+        float cmz = m.mz - magOffsetZ;
+        magNorm = sqrtf(cmx * cmx + cmy * cmy + cmz * cmz);
+    }
+    // Heading shown as magnetic/true: the gap between them should be exactly
+    // the 13.0 declination constant -- eyeball proof the correction is live.
+    // A phone compass set to "true north" should agree with the SECOND number.
     if (c.ok) {
-        snprintf(line, sizeof(line), "HDG %5.1f P%+3.0f R%+3.0f",
-                 c.heading, c.pitchDeg, c.rollDeg);
+        snprintf(line, sizeof(line), "H%5.1f/%5.1f M%2.0f%s",
+                 c.headingMag, c.heading, magNorm,
+                 calStatus().calibrated ? "CAL" : "---");
     } else {
         snprintf(line, sizeof(line), "HDG --  (no sample)");
     }
     oledText(0, 4, line);
 
 #if MESH_MODE
-    // Mesh readout: distance to the last-heard group member, link quality,
-    // and mesh activity. Same liveness rule as the range test: AGE counting
-    // up while nothing else changes = that member has gone quiet.
+    // Page 5: the navigation state line -- THE field-test readout. State,
+    // target member id, distance, absolute bearing, position age. The state
+    // word must match what the ring is doing; that cross-check is the point.
+    {
+        const char *stateStr =
+            ringMode == RING_NO_FIX         ? "NOFX" :
+            ringMode == RING_LOST           ? "LOST" :
+            ringMode == RING_STALE          ? "STAL" :
+            ringMode == RING_NAVIGATING     ? "NAV"  :
+                                              "ARRV";   // both arrived states
+        if (haveTgt && g.valid) {
+            snprintf(line, sizeof(line), "%s %u %4.0fm B%03.0f %lus",
+                     stateStr, tgtId, distM, targetBrg, (unsigned long)tgtAgeS);
+        } else {
+            snprintf(line, sizeof(line), "%s  (no member yet)", stateStr);
+        }
+        oledText(0, 5, line);
+    }
+
     if (!r.online) {
-        oledText(0, 5, "RADIO OFFLINE");
+        oledText(0, 6, "RADIO OFFLINE");
     } else if (r.rxCount == 0) {
-        oledText(0, 5, "D  ----  mx  ----");
         oledText(0, 6, "RSSI ---   SNR ---");
         oledText(0, 7, "mesh: listening...");
     } else {
-        if (r.distValid) {
-            snprintf(line, sizeof(line), "D%6.0fm mx%6.0fm", r.distM, r.maxDistM);
-        } else {
-            snprintf(line, sizeof(line), "D NOFIX  mx%6.0fm", r.maxDistM);
-        }
-        oledText(0, 5, line);
-
         snprintf(line, sizeof(line), "RSSI%5.0f  SNR%5.1f", r.rssi, r.snr);
         oledText(0, 6, line);
 
         // Sxx = who we heard last; hops left in that packet (3 = direct from
-        // them, <3 = it came through a relay); our own relay count; age.
+        // them, <3 = it came through a relay); our own relay count; age of
+        // the last processed packet (roster age on page 5 can differ -- a
+        // no-fix beacon refreshes this line but not the position).
         uint32_t age = (millis() - r.lastRxMillis) / 1000;
         snprintf(line, sizeof(line), "S%u h%u rly%lu age%3lus",
                  r.lastSender, r.lastHops, (unsigned long)r.relayCount,
@@ -389,8 +585,10 @@ void loop() {
     }
 
     if (haveMag) {
-        Serial.printf("MAG: %8.2f %8.2f %8.2f uT%s\n",
-                      m.mx, m.my, m.mz, m.overflow ? "   <- OVERFLOW" : "");
+        Serial.printf("MAG: %8.2f %8.2f %8.2f uT  |corrected| %.1f uT%s%s\n",
+                      m.mx, m.my, m.mz, magNorm,
+                      calStatus().calibrated ? " (cal)" : " (UNCAL)",
+                      m.overflow ? "   <- OVERFLOW" : "");
     } else {
         Serial.printf("MAG: %s\n", magOk ? "read failed this tick" : "OFFLINE (chip ID failed at boot)");
     }
@@ -400,9 +598,10 @@ void loop() {
     // calibration fills them in. The offsets are echoed so it's obvious from the
     // log alone which state you're looking at.
     if (c.ok) {
-        Serial.printf("CMP: heading %6.1f deg  pitch %6.1f  roll %6.1f  "
+        Serial.printf("CMP: mag %6.1f  true %6.1f (decl %+.1f)  pitch %6.1f  roll %6.1f  "
                       "(offsets %.1f %.1f %.1f uT)\n",
-                      c.heading, c.pitchDeg, c.rollDeg,
+                      c.headingMag, c.heading, MAGNETIC_DECLINATION_DEG,
+                      c.pitchDeg, c.rollDeg,
                       magOffsetX, magOffsetY, magOffsetZ);
     } else {
         Serial.printf("CMP: no heading (%s%s)\n",
@@ -410,6 +609,21 @@ void loop() {
                       c.haveMag ? "" : "no mag sample");
     }
 
+#if MESH_MODE
+    if (haveTgt && g.valid) {
+        static const char *modeNames[] = {"NO_FIX", "LOST", "NAVIGATING",
+                                          "STALE", "ARRIVED_FLASH",
+                                          "ARRIVED_STEADY", "POINTING"};
+        Serial.printf("NAV: [%s] member %u  dist %.1fm  brg %.1f  rel %.1f  "
+                      "age %lus  -> LED %d (pair %d+%d)\n",
+                      modeNames[ringMode], tgtId, distM, targetBrg, relBrg,
+                      (unsigned long)tgtAgeS, pointerLed,
+                      pointerLed * 2, pointerLed * 2 + 1);
+    } else {
+        Serial.printf("NAV: %s\n",
+                      !g.valid ? "no GPS fix" : "no member heard yet");
+    }
+#else
     if (navValid) {
         Serial.printf("NAV: dist %.1fm  brg %.1f  rel %.1f  -> LED %d (pair %d+%d)\n",
                       distM, targetBrg, relBrg, pointerLed,
@@ -418,4 +632,5 @@ void loop() {
         Serial.printf("NAV: searching (%s)\n",
                       g.valid ? "fix ok, waiting on heading" : "no GPS fix");
     }
+#endif
 }

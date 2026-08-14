@@ -52,6 +52,7 @@ static void simDeliver(SimNet &net, int toId, const MeshPacket &pkt, uint32_t no
 
     MeshPacket relayed = pkt;
     relayed.hopLimit = pkt.hopLimit - 1;
+    relayed.txNode   = (uint8_t)toId;   // the relayer is the new transmitter
     for (int n = 1; n < SIM_MAX; n++) {
         if (net.link[toId][n]) simDeliver(net, n, relayed, now);
     }
@@ -72,6 +73,7 @@ static MeshPacket simPacket(uint8_t sender, uint16_t id, uint8_t hops, uint8_t g
     p.hopLimit = hops;
     p.msgType  = MESH_MSG_POSITION;
     p.groupId  = group;
+    p.txNode   = sender;   // fresh packet: originator is the transmitter
     return p;
 }
 
@@ -85,6 +87,7 @@ bool runMeshSelfTests() {
         in.senderId = 7; in.packetId = 0xBEEF; in.hopLimit = 3;
         in.msgType = MESH_MSG_POSITION; in.groupId = 42;
         in.latE7 = 372755809; in.lonE7 = -1220247906; in.fixValid = true;
+        in.txNode = 9;   // relayed frame: transmitter differs from originator
 
         uint8_t wire[MESH_WIRE_SIZE];
         meshSerialize(in, wire);
@@ -93,7 +96,8 @@ bool runMeshSelfTests() {
         ok = ok && out.senderId == in.senderId && out.packetId == in.packetId
                 && out.hopLimit == in.hopLimit && out.msgType == in.msgType
                 && out.groupId == in.groupId && out.latE7 == in.latE7
-                && out.lonE7 == in.lonE7 && out.fixValid == in.fixValid;
+                && out.lonE7 == in.lonE7 && out.fixValid == in.fixValid
+                && out.txNode == in.txNode;
         check("codec: round-trip", ok, ok, 1);
 
         wire[0] = 'X';   // corrupt magic

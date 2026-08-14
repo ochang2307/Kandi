@@ -22,12 +22,15 @@
 #define MESH_DEVICE_ID  1
 #define MESH_GROUP_ID   1
 
-// Testing hook: sender IDs this node pretends not to hear. Dropped at
+// Testing hook: node ids this board pretends not to hear. Dropped at
 // reception BEFORE any protocol step -- it models RF (out of range), not
-// policy. Forces a multi-hop topology on a desk where everyone hears everyone:
+// policy, so it filters on the TRANSMITTER of each frame (the txNode byte,
+// which a relayer overwrites with its own id), NOT the originator. Blocking
+// the originator would also kill relayed copies and defeat the whole test.
+// Forces a multi-hop topology on a desk where everyone hears everyone:
 //   board 1: {3}   board 2: {}   board 3: {1}
 // gives the line 1 <-> 2 <-> 3 from network_test.py, with 2 as the only bridge.
-#define MESH_BLOCKED_SENDERS  {}
+#define MESH_BLOCKED_SENDERS  {3}
 
 // Design-doc cadence: position beacon every 10s with +/-2s jitter. Shorten
 // temporarily for impatient desk tests, but field tests use the real numbers
@@ -39,19 +42,24 @@
 #define MESH_HOP_LIMIT        3
 
 // ================================ Wire format ================================
-// 18 bytes on air, explicitly serialized byte-by-byte (little-endian) in
+// 19 bytes on air, explicitly serialized byte-by-byte (little-endian) in
 // meshSerialize() -- NOT memcpy'd from the struct -- so the format is
 // deterministic regardless of compiler padding or platform endianness:
 //
-//   [0..3]   magic "KNDM"        protocol discriminator + version (bump on change)
-//   [4]      sender_id   u8
-//   [5..6]   packet_id   u16     per-sender sequence number
-//   [7]      hop/type    u8      high nibble hop_limit, low nibble msg_type
+//   [0..3]   magic "KNDN"        protocol discriminator + version (bump on change)
+//   [4]      sender_id   u8     ORIGINATOR -- never changes as the packet hops
+//   [5..6]   packet_id   u16    per-sender sequence number
+//   [7]      hop/type    u8     high nibble hop_limit, low nibble msg_type
 //   [8]      group_id    u8     (placeholder -- real AES group key comes with bonding)
 //   [9..12]  latE7       i32    degrees * 1e7 (u-blox fixed-point; no floats on air)
 //   [13..16] lonE7       i32
 //   [17]     flags       u8     bit0 = position is a live fix
-static const size_t MESH_WIRE_SIZE = 18;
+//   [18]     tx_node     u8     who TRANSMITTED this frame -- the originator on
+//                               a beacon, the relayer on a relay. Dedup keys on
+//                               (sender_id, packet_id); tx_node exists so the
+//                               out-of-range simulation (and later, per-hop
+//                               diagnostics) can see who was actually on air.
+static const size_t MESH_WIRE_SIZE = 19;
 
 enum MeshMsgType : uint8_t {
     MESH_MSG_POSITION = 0,
@@ -61,7 +69,7 @@ enum MeshMsgType : uint8_t {
 // In-memory packet. Natural types here; nibble packing happens only at the
 // serialize/deserialize boundary.
 struct MeshPacket {
-    uint8_t  senderId;
+    uint8_t  senderId;    // originator
     uint16_t packetId;
     uint8_t  hopLimit;    // 0-15 (4 bits on the wire)
     uint8_t  msgType;     // MeshMsgType, 0-15
@@ -69,6 +77,7 @@ struct MeshPacket {
     int32_t  latE7;
     int32_t  lonE7;
     bool     fixValid;
+    uint8_t  txNode;      // transmitter of this frame (relayer stamps its own id)
 };
 
 // =============================== Seen cache ==================================
@@ -143,7 +152,8 @@ MeshAction meshHandlePacket(MeshNode &node, const MeshPacket &pkt, uint32_t nowM
 bool meshScheduleRelay(MeshNode &node, const MeshPacket &pkt, float snrDb,
                        uint32_t nowMs);
 
-// Pop one due relay into `out`, skipping cancelled entries. Call every loop
+// Pop one due relay into `out`, skipping cancelled entries. Stamps this node's
+// id into out.txNode -- we are about to be the transmitter. Call every loop
 // pass; returns false when nothing is due yet.
 bool meshRelayDue(MeshNode &node, uint32_t nowMs, MeshPacket &out);
 
@@ -157,5 +167,7 @@ MeshPacket meshMakeBeacon(MeshNode &node, int32_t latE7, int32_t lonE7,
 // linearly to 2000ms at/above +10dB.
 uint32_t meshRelayDelayMs(float snrDb);
 
-// True if `senderId` is in this build's MESH_BLOCKED_SENDERS list.
-bool meshSenderBlocked(uint8_t senderId);
+// True if `nodeId` is in this build's MESH_BLOCKED_SENDERS list. Callers pass
+// the frame's txNode (the transmitter), not the originator -- RF range is
+// about who's on air right now.
+bool meshSenderBlocked(uint8_t nodeId);

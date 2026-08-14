@@ -5,7 +5,7 @@
 // Hard-iron offsets, microtesla. Zero = no correction applied yet.
 float magOffsetX = 0.0f;
 float magOffsetY = 0.0f;
-float magOffsetZ = 0.0f;
+float magOffsetZ = 0.0f; 
 
 // --- Direct translations of CoreLogic/tilt_compensation.py ---
 //
@@ -83,6 +83,7 @@ CompassData compassHeading() {
     CompassData out;
     out.ok = false;
     out.heading = 0.0f;
+    out.headingMag = 0.0f;
     out.pitchDeg = 0.0f;
     out.rollDeg = 0.0f;
 
@@ -103,9 +104,15 @@ CompassData compassHeading() {
     PitchRoll pr = pitchRoll(out.imu.ax, out.imu.ay, out.imu.az);
     HorizontalField h = tiltCompensate(mx, my, mz, pr.pitch, pr.roll);
 
-    out.heading  = headingFrom(h.Xh, h.Yh);
-    out.pitchDeg = pr.pitch * RAD_TO_DEG;
-    out.rollDeg  = pr.roll * RAD_TO_DEG;
+    // Declination correction happens HERE, at the consumption boundary --
+    // headingFrom() stays purely magnetic and byte-identical to the verified
+    // Python. East declination positive: true = magnetic + declination,
+    // re-normalized to the project's 0-360 convention.
+    out.headingMag = headingFrom(h.Xh, h.Yh);
+    out.heading    = fmodf(out.headingMag + MAGNETIC_DECLINATION_DEG + 360.0f,
+                           360.0f);
+    out.pitchDeg   = pr.pitch * RAD_TO_DEG;
+    out.rollDeg    = pr.roll * RAD_TO_DEG;
     out.ok = true;
     return out;
 }
