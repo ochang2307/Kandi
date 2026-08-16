@@ -19,6 +19,22 @@
 // all is unpowered or miswired. This toggle tells those two apart.
 #define IMU_DEBUG_RAW 0
 
+// --- Axis remap: physical IMU frame -> device frame ---
+// Same story as the magnetometer's remap (mag.h): the compass math only
+// needs the two chips to agree on ONE frame, and the QMI8658's package
+// orientation on the PCB is independent of the QMC6310's. A mismatched
+// accel X/Y is invisible flat (pitch/roll are 0/0 regardless) and wrecks
+// tilt compensation -- the "heading fine flat, wrong when tilted" symptom.
+// Order of operations: swap first, then flips. Applied to accel AND gyro so
+// the whole IMU stays one consistent frame.
+#define IMU_SWAP_XY 1   // confirmed 2026-08 by 4-pose capture: antenna-down
+                        // put gravity on ay (accel Y = board forward), right-
+                        // edge-down put it on ax (accel X = board right).
+                        // Pure swap, no flips -- signs verified in both poses.
+#define IMU_FLIP_X  0
+#define IMU_FLIP_Y  0
+#define IMU_FLIP_Z  0
+
 struct ImuData {
     bool  ok;              // true if this sample was actually read
     float ax, ay, az;      // acceleration, m/s^2 (includes gravity)

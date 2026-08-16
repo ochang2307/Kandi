@@ -28,6 +28,20 @@ CRGB leds[NUM_LEDS];       // pixel buffer; edits here do nothing until FastLED.
 // BOOT button (IO0). Only input we have; used to cancel the arrival flash.
 #define BUTTON_PIN 0
 
+// --- Ring mounting config (display-layer, per the port rules) ---
+// RING_MIRRORED: set to 1 if the pointer sweeps the WRONG WAY around the ring
+// when you rotate (and the OLED HDG number increases with clockwise rotation,
+// proving the compass itself is fine). Physical index order depends on which
+// face of the ring you're looking at -- a free-hanging ring flipped over is
+// exactly this bug.
+// RING_OFFSET_LEDS: the physical LED index sitting at 12 o'clock. 0 while the
+// ring dangles on jumpers; set it once the ring is actually mounted.
+#define RING_MIRRORED    1   // set 2026-08: pointer swept the wrong way while
+                             // the 4-pose mag capture proved the compass frame
+                             // correct -- so the mirror is in the ring's
+                             // physical index order (it hangs face-flipped).
+#define RING_OFFSET_LEDS 0
+
 // Ring display state, per the design doc's LED UX. The 1s nav tick DECIDES
 // (mode + which logical LED + blink rate), the fast ~25ms render tick DRAWS,
 // so blinks and breathing stay smooth while the nav math runs at 1Hz.
@@ -61,9 +75,18 @@ bool magOk = false;        // ditto for the magnetometer
 // Yellow and green are RESERVED (battery/charging, design doc). LOST uses
 // magenta so it can never be confused with the blue NO_FIX pulse -- both sit
 // at the top pixel, and "no GPS" vs "no friend" need different answers.
+// Logical LED position (0-15, 0 = top, clockwise) -> physical strip index,
+// applying the mounting config above. Mirroring reflects about the 12
+// o'clock axis; the offset then rotates to wherever LED 0 actually sits.
+static int physIndex(int logical) {
+    int idx = logical % NUM_LEDS;
+    if (RING_MIRRORED) idx = (NUM_LEDS - idx) % NUM_LEDS;
+    return (idx + RING_OFFSET_LEDS) % NUM_LEDS;
+}
+
 static void setPair(int sector, const CRGB &c) {
-    leds[(sector * 2)     % NUM_LEDS] = c;
-    leds[(sector * 2 + 1) % NUM_LEDS] = c;
+    leds[physIndex(sector * 2)]     = c;
+    leds[physIndex(sector * 2 + 1)] = c;
 }
 
 static void renderRing() {
@@ -74,13 +97,13 @@ static void renderRing() {
         case RING_NO_FIX: {
             // ~2s blue breathing at the top pixel.
             uint8_t b = triwave8((uint8_t)(now / 8));
-            leds[0] = CRGB(0, 0, scale8(b, 120));
+            leds[physIndex(0)] = CRGB(0, 0, scale8(b, 120));
             break;
         }
         case RING_LOST: {
             // Slower (~4s) magenta breathing at the top pixel. Not a bearing.
             uint8_t b = triwave8((uint8_t)(now / 16));
-            leds[0] = CRGB(scale8(b, 100), 0, scale8(b, 100));
+            leds[physIndex(0)] = CRGB(scale8(b, 100), 0, scale8(b, 100));
             break;
         }
         case RING_NAVIGATING: {
@@ -367,7 +390,12 @@ void loop() {
             ringMode = (millis() < arrivedFlashUntil) ? RING_ARRIVED_FLASH
                                                       : RING_ARRIVED_STEADY;
         } else {
-            wasArrived = false;
+            // Hysteresis on the flash re-arm: arrive at <10m, but only re-arm
+            // after clearly leaving (>15m). Two GPS receivers each carry
+            // ~2-3m of error, so computed distance wobbles by several meters
+            // while standing still -- without the gap, hovering near 10m
+            // would re-fire the 8s flash on every wobble.
+            if (distM > 15.0) wasArrived = false;
             ringMode = RING_NAVIGATING;
             // device.py blink_rate_for(): <50m fast, <200m medium, else slow.
             blinkHalfMs = distM < 50.0 ? 150 : distM < 200.0 ? 400 : 800;
@@ -439,10 +467,11 @@ void loop() {
     // offsets are loaded, i.e. whether the heading deserves any trust.
     // (Pitch/roll moved to serial-only -- the CMP line still has them.)
     float magNorm = 0;
+    float cmx = 0, cmy = 0, cmz = 0;   // corrected field, device frame
     if (haveMag) {
-        float cmx = m.mx - magOffsetX;
-        float cmy = m.my - magOffsetY;
-        float cmz = m.mz - magOffsetZ;
+        cmx = m.mx - magOffsetX;
+        cmy = m.my - magOffsetY;
+        cmz = m.mz - magOffsetZ;
         magNorm = sqrtf(cmx * cmx + cmy * cmy + cmz * cmz);
     }
     // Heading shown as magnetic/true: the gap between them should be exactly
@@ -585,8 +614,10 @@ void loop() {
     }
 
     if (haveMag) {
-        Serial.printf("MAG: %8.2f %8.2f %8.2f uT  |corrected| %.1f uT%s%s\n",
-                      m.mx, m.my, m.mz, magNorm,
+        // corr x/y/z is the frame-diagnosis readout: flat + calibrated, cmz
+        // should be ~-40 uT here (field points down). ~+40 = Z flipped (mag.h).
+        Serial.printf("MAG: raw %7.1f %7.1f %7.1f  corr %6.1f %6.1f %6.1f  |M| %.1f uT%s%s\n",
+                      m.mx, m.my, m.mz, cmx, cmy, cmz, magNorm,
                       calStatus().calibrated ? " (cal)" : " (UNCAL)",
                       m.overflow ? "   <- OVERFLOW" : "");
     } else {

@@ -74,6 +74,20 @@ float headingFrom(float Xh, float Yh);
 // of hardcoding.
 static const float MAGNETIC_DECLINATION_DEG = 13.0f;
 
+// --- Heading mirror toggle ---
+// Set to 1 if the OLED heading DECREASES when you rotate the board clockwise
+// (viewed from above). That symptom means the magnetometer's physical Y axis
+// is flipped relative to the frame the verified math assumes -- magnitude
+// and calibration are unaffected (|M| can't catch a mirror), but every
+// heading comes out reflected about north.
+//
+// Applied at the output boundary in compassHeading() as (360 - heading);
+// pitchRoll/tiltCompensate/headingFrom stay byte-identical to the verified
+// Python. NOTE: an output-side mirror is exact when flat and approximate
+// under heavy tilt -- if headings misbehave only at extreme tilt after
+// enabling this, the flip belongs on the mag driver's Y axis instead.
+#define COMPASS_MIRROR_HEADING 0
+
 // One full pipeline pass: sample both sensors, apply the hard-iron offsets,
 // and return the heading. Non-blocking -- if either sensor has no fresh sample
 // this returns with ok = false rather than waiting (the GPS UART overruns if

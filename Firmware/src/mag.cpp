@@ -58,9 +58,18 @@ bool magRead(MagData &out) {
 
     // SensorLib reports Gauss; microtesla is the conventional unit for compass
     // work and keeps the numbers human-sized (Earth's field is ~25-65 uT).
-    out.mx = MagnetometerUtils::gaussToMicroTesla(data.magnetic_field.x);
-    out.my = MagnetometerUtils::gaussToMicroTesla(data.magnetic_field.y);
-    out.mz = MagnetometerUtils::gaussToMicroTesla(data.magnetic_field.z);
+    // Axis flips (mag.h) apply HERE, at the physical->device frame boundary:
+    // everything downstream (calibration capture included) sees the remapped
+    // frame, so offsets stay consistent with what the compass consumes.
+    float px = MagnetometerUtils::gaussToMicroTesla(data.magnetic_field.x);
+    float py = MagnetometerUtils::gaussToMicroTesla(data.magnetic_field.y);
+    float pz = MagnetometerUtils::gaussToMicroTesla(data.magnetic_field.z);
+#if MAG_SWAP_XY
+    { float t = px; px = py; py = t; }
+#endif
+    out.mx = px * (MAG_FLIP_X ? -1.0f : 1.0f);
+    out.my = py * (MAG_FLIP_Y ? -1.0f : 1.0f);
+    out.mz = pz * (MAG_FLIP_Z ? -1.0f : 1.0f);
     out.overflow = data.overflow;
     out.ok = true;
 

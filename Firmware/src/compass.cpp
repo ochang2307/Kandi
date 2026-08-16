@@ -109,6 +109,11 @@ CompassData compassHeading() {
     // Python. East declination positive: true = magnetic + declination,
     // re-normalized to the project's 0-360 convention.
     out.headingMag = headingFrom(h.Xh, h.Yh);
+#if COMPASS_MIRROR_HEADING
+    // Sensor frame is mirrored relative to the assumed one (see compass.h):
+    // reflect the heading about north before anything consumes it.
+    out.headingMag = fmodf(360.0f - out.headingMag, 360.0f);
+#endif
     out.heading    = fmodf(out.headingMag + MAGNETIC_DECLINATION_DEG + 360.0f,
                            360.0f);
     out.pitchDeg   = pr.pitch * RAD_TO_DEG;

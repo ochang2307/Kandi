@@ -18,6 +18,26 @@
 // answered from one that answered but is sitting in suspend or saturating.
 #define MAG_DEBUG_RAW 0
 
+// --- Axis remap: physical mag frame -> device frame ---
+// The compass math requires the mag and accel to agree on one frame (X fwd,
+// Y right, Z up -- the accel defines it: +Z reads ~+9.8 flat). The two chips
+// are different packages in different orientations on the PCB, so agreement
+// is luck, not physics. A mismatched axis is INVISIBLE flat (mz drops out of
+// tilt compensation at zero pitch/roll) and wrecks headings under tilt.
+//
+// Diagnosis (board flat, calibrated): corrected mz should read ~-40 uT here
+// (Earth's field points steeply DOWN; down = negative on an up-axis).
+// Reading ~+40 instead = Z flipped -> set MAG_FLIP_Z 1.
+//
+// !! After changing any flip: stored calibration offsets were captured in
+// !! the old frame -- run 'calclear' + 'cal' again on every board.
+// Order of operations: swap first, then flips.
+#define MAG_SWAP_XY 0
+#define MAG_FLIP_X 0
+#define MAG_FLIP_Y 0
+#define MAG_FLIP_Z 1   // confirmed 2026-08: flat corrected mz read +40 (field
+                       // points DOWN here) -> mag Z was inverted vs accel Z
+
 struct MagData {
     bool  ok;              // true if this sample was actually read
     float mx, my, mz;      // magnetic field, microtesla

@@ -44,8 +44,21 @@ requires a phone app. Apple's offline finding only works at ~10-30m.
   coverage feedback, offsets persisted to NVS per board. Corrected field
   magnitude holds 46–56 µT through full rotation on all three boards — against
   a raw hard-iron offset ~5× Earth's field.
-- 🔄 **In progress:** the two-device "find your friend" demo — pointing the
-  LED ring at a live mesh member instead of a fixed waypoint.
+- ✅ **"Find your friend" pipeline working end-to-end.** Two boards point
+  their LED rings at each other live: mesh position packets → per-member
+  roster → great-circle bearing → tilt-compensated, declination-corrected
+  compass heading → ring sector. Heading holds within ~2–3° through tilt.
+  Ring states per the design doc: distance-bucketed blink while navigating,
+  a distinct "remembered, not live" indication when a member's position goes
+  stale (>30 s), lost (>120 s), and arrival within GPS resolution.
+- ✅ **Arrival lifecycle verified.** Walk-in test: full-ring flash fires on
+  crossing the 10 m threshold, decays to a steady indication after 8 s, and
+  re-arms behind a 15 m hysteresis gap so GPS noise at the threshold can't
+  re-fire it — the arrival threshold sits at the GNSS relative-error floor
+  by design, which is the measured case for deferring final approach to UWB
+  in v2.
+- 🔄 **In progress:** the park field demo — full "find your friend" walk at
+  real distances, plus the three-board relay at range.
 
 ## Hardware
 
@@ -102,6 +115,7 @@ synthetic sensor vectors, real LoRa transmit replaces a simulated one).
 | `radio.cpp` | SX1262 LoRa via RadioLib, non-blocking (interrupt-driven), mesh + range-test modes |
 | `mesh.cpp` | Ported managed-flooding mesh: deterministic wire format, fixed-size seen cache with expiry, SNR-weighted scheduled relay queue |
 | `calibration.cpp` | Magnetometer hard-iron capture with live coverage UI, offsets persisted in NVS |
+| `roster.cpp` | Last-known position per mesh member; feeds the live navigation target |
 
 Every ported module ships with the **original Python test vectors as
 boot-time self-tests** — 38 cases across two suites: distance, bearing,
@@ -174,6 +188,22 @@ fix distinguishes the frame's transmitter from the packet's originator on the
 wire, because radio range is a property of who is on the air, not whose data
 is inside. The desk test then showed positions crossing the simulated gap
 with one hop consumed.
+
+**Two right-handed chips, one left-handed convention.** Tilt-compensated
+headings were correct with the board flat and wildly wrong under tilt — the
+signature of the accelerometer and magnetometer disagreeing about the shared
+sensor frame, which is invisible at zero tilt (the vertical mag axis and the
+horizontal accel axes drop out of the math). The compass algorithm, verified
+in simulation, embodies a left-handed frame; both physical chips are
+right-handed, so each required exactly one reflection to match — and the two
+chips were also mounted with different in-plane orientations. Diagnosed with
+a four-pose capture in which the gravity-referenced poses were decisive
+(pointing a board at "north" is sloppy; gravity is not): whichever axis
+catches ±1 g, or the ~40 µT downward field component, names itself. The fix
+is two compile-time remaps at the driver boundary; the verified math is
+untouched. A key discriminator along the way: corrected field *magnitude*
+stays constant through tilt when the problem is frames (reflections preserve
+magnitude) and swings when the problem is calibration.
 
 **Retiring a risk with measurement.** The design doc flagged possible
 magnetometer interference from LED ring switching currents. Measured with the

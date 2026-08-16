@@ -84,6 +84,21 @@ bool imuRead(ImuData &out) {
         return false;
     }
 
+    // Physical -> device frame remap (imu.h): swap first, then flips.
+#if IMU_SWAP_XY
+    { float t = ax; ax = ay; ay = t; }
+    { float t = gx; gx = gy; gy = t; }
+#endif
+#if IMU_FLIP_X
+    ax = -ax; gx = -gx;
+#endif
+#if IMU_FLIP_Y
+    ay = -ay; gy = -gy;
+#endif
+#if IMU_FLIP_Z
+    az = -az; gz = -gz;
+#endif
+
     out.ax = ax * G_TO_MPS2;
     out.ay = ay * G_TO_MPS2;
     out.az = az * G_TO_MPS2;

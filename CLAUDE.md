@@ -14,13 +14,17 @@ architecture changes.
 
 ## Current phase
 
-Phase 2: dev-board prototype. All core logic is written and unit-tested in
-platform-independent Python (done pre-hardware). Hardware just arrived:
-**3× LilyGo T-Beam Supreme** boards. Next work is bring-up and porting the
-proven Python logic to the boards (Arduino/PlatformIO, C++).
+Phase 2: dev-board prototype, on **3× LilyGo T-Beam Supreme** boards
+(Arduino/PlatformIO, C++). Nearly complete: all peripherals up, all core
+logic ported and self-testing at boot, mesh verified on a 3-board desk
+topology, compasses calibrated and frame-corrected, and the full
+"find your friend" pipeline works — two boards point their rings at each
+other live, with the design doc's ring states (navigating/stale/lost/
+arrived) all verified. See the milestone list at the bottom for exact
+status.
 
-Goal of this phase: a two-device "find your friend" field demo + video,
-with a third board proving mesh relay.
+What remains in this phase: the park field demo + video (real distances —
+blink buckets, arrival re-arm, then the third board relaying at range).
 
 ## Repo structure
 
@@ -115,6 +119,8 @@ Ported core logic (hardware-free, mirrors `CoreLogic/`): `compass.cpp`/`.h`,
 `selftest.cpp`/`.h` + `mesh_test.cpp` running the ported logic against Python
 golden values / network.py scenarios at boot. `calibration.cpp`/`.h` is the
 mag hard-iron calibration (serial-command driven, NVS-persisted).
+`roster.cpp`/`.h` tracks last-known position per mesh member (fixed 8 slots)
+— the nav target is the most recently heard member.
 
 **Power-on order: init the PMU FIRST.** The AXP2101 gates every peripheral
 3.3V rail, and they boot OFF. The ESP32 itself runs from an always-on rail
@@ -238,6 +244,44 @@ dance.
   moves. For accel, tip the board onto each edge and watch the ~9.8 migrate
   between axes.
 
+**Sensor axis frames (the tilt-compensation saga — will bite again on the
+custom PCB).** The compass math only works if accel and mag report in ONE
+shared frame. On this board they don't, out of the box. Root cause, worth
+internalizing: **both chips are physically right-handed (all real silicon is),
+but the verified Python math embodies a LEFT-handed frame** (X fwd, Y right,
+Z up) — so each sensor needs exactly one reflection to match it. On the
+T-Beam Supreme (confirmed 2026-08 by 4-pose capture):
+- QMC6310N mag: Z inverted → `MAG_FLIP_Z 1` in mag.h.
+- QMI8658 accel: X/Y swapped (accel X = board-right, accel Y =
+  board-forward) → `IMU_SWAP_XY 1` in imu.h. Applied to gyro too.
+- Remaps live at the DRIVER boundary (mag.cpp/imu.cpp), never in compass.cpp.
+- **Changing any MAG remap invalidates stored calibration** (offsets are
+  captured in the remapped frame) — `calclear` + `cal` after. IMU-side remaps
+  don't touch calibration.
+Symptom signatures, for diagnosis:
+- Frame mismatch is INVISIBLE flat (mz drops out of tilt compensation at
+  0/0 pitch/roll; accel X/Y don't matter at zero tilt) and wrecks headings
+  under tilt: "right when flat, wild when tilted" = frames, not calibration.
+- Discriminator: |M| steady through the tilt = frame problem; |M| swinging =
+  calibration problem. (Reflections preserve magnitude; bad offsets don't.)
+- Quick vertical-axis check: flat + calibrated, corrected mz must read ≈ −40
+  µT here (field points steeply DOWN; down = negative on an up axis). +40 =
+  mag Z flipped.
+- Full diagnosis: 4-pose capture — flat N, flat E, antenna-end straight down,
+  right-edge down — reading the corrected mag + accel serial lines. The two
+  GRAVITY poses are the decisive ones (no compass-pointing slop): whichever
+  axis catches ±9.8 / the +40 µT down-field names itself.
+Verified after the fix: heading holds through tilt to ~2-3°, pitch/roll land
+on the correct axes, and two boards point at each other through the full
+mesh → compass → ring pipeline.
+
+**Ring orientation:** `RING_MIRRORED 1` (main.cpp) — the pointer swept the
+wrong way with a proven-correct compass, i.e. the physical LED index order
+runs CCW from the viewing side. `RING_OFFSET_LEDS` rotates LED 0 to 12
+o'clock once the ring is mounted; while it dangles on jumpers, hold it with
+LED 0 toward the antenna (the current "forward"). Both knobs are
+display-layer only (`physIndex()`), per the mapping-stays-out-of-logic rule.
+
 ## Ported core logic (C++ on hardware)
 
 These mirror the verified `CoreLogic/` Python. The rule from the architecture
@@ -268,6 +312,12 @@ that samples both sensors and runs the pipeline.
 - Verified: the actual `compass.cpp` compiles on the host against a stub
   `Arduino.h` and passes the same 26-case round-trip as `compass_test.py` at
   err=0.0000. Links the real firmware source, not a copy.
+- **Declination:** the mag yields MAGNETIC heading; bearing() is TRUE-north.
+  `compassHeading()` adds `MAGNETIC_DECLINATION_DEG` (13.0 = Saratoga,
+  hardcoded, location-specific — change it if testing elsewhere) as its final
+  step. `c.heading` is true (use against bearing()); `c.headingMag` is
+  magnetic (display). OLED shows both as `H<mag>/<true>` — they must differ
+  by exactly 13.0. `headingFrom()` itself stays purely magnetic.
 
 **Hard-iron calibration (`calibration.cpp`/`.h`).** DONE on all 3 boards
 (2026-08). Min/max per axis over a 30s capture, center = (max+min)/2; soft
@@ -463,5 +513,21 @@ formulaic writing.
      2000ms, so end-board relays sometimes collide (small R loss); real SNR
      spread or added jitter fixes it.
 6. Integration: device_tick on hardware — board A's ring points at board B.
+   — CORE DONE (2026-08): boards 2 and 3 point at each other live through
+     mesh → roster (`roster.cpp`, last-known position per member, 8 slots) →
+     nav → compass → ring. Ring states per design doc in main.cpp:
+     NAVIGATING (blink rate = device.py distance buckets), STALE >30s (dim
+     breathing at last bearing), LOST >120s (magenta pulse, no bearing),
+     ARRIVED <10m (8s full-ring flash → steady, BOOT button cancels, 15m
+     re-arm hysteresis), NO_FIX (blue pulse). Verified: pointer tracking,
+     tilt hold ~2-3°, stale/lost transitions, both startup pulses, and the
+     full ARRIVED lifecycle (walk-in test 2026-08: flash fires at the 10m
+     crossing, decays after 8s per spec — it is NOT supposed to stay
+     flashing — and re-arms only after a genuine >15m excursion for one
+     beacon cycle; standing at ~10m flickers ARRV/NAV on page 5, which is
+     GPS noise at the threshold, cosmetic). Tunables if the feel is wrong:
+     flash duration (8000ms) and re-arm distance (15m) in main.cpp; don't
+     drop re-arm below ~13m or threshold noise re-fires the flash.
+     Blink buckets untested at range (backyard too small) — park-test item.
 7. Park field test + demo video. Then third board for mesh relay testing
    (desk-verified already; the park run re-proves it at real range).
