@@ -211,6 +211,28 @@ void radioTick() {
                 float rssi = radio.getRSSI();
                 MeshAction act = meshHandlePacket(meshNode, pkt, millis());
 
+                // Hops traveled: packets always originate at MESH_HOP_LIMIT,
+                // so 3 - received limit = how many relays this copy rode.
+                uint8_t hopsTraveled =
+                    pkt.hopLimit <= MESH_HOP_LIMIT ? MESH_HOP_LIMIT - pkt.hopLimit : 0;
+
+                // Originator-identity tripwires. The relay path must never
+                // mutate sender_id (roster attribution depends on it) --
+                // these two impossible combinations are the ways that bug
+                // would first show, so make them loud instead of silent:
+                //  - 0 hops but transmitter != originator: someone relayed
+                //    without decrementing, or overwrote sender_id.
+                //  - >0 hops but transmitter == originator: an "originator"
+                //    is rebroadcasting its own decremented packet.
+                if (hopsTraveled == 0 && pkt.txNode != pkt.senderId) {
+                    Serial.printf("MESH: !! IDENTITY BUG? 0-hop packet from %u transmitted by %u\n",
+                                  pkt.senderId, pkt.txNode);
+                }
+                if (hopsTraveled > 0 && pkt.txNode == pkt.senderId) {
+                    Serial.printf("MESH: !! IDENTITY BUG? %u-hop packet from %u transmitted by itself\n",
+                                  hopsTraveled, pkt.senderId);
+                }
+
                 Serial.printf("MESH: RX from %u via %u #%u hops %u  %s  RSSI %.1f  SNR %.1f\n",
                               pkt.senderId, pkt.txNode, pkt.packetId, pkt.hopLimit,
                               meshActionStr(act), rssi, snr);
@@ -239,10 +261,34 @@ void radioTick() {
                     // Feed the roster -- only with real positions. A no-fix
                     // beacon must NOT overwrite a member's last-known spot;
                     // their entry just ages, which is what drives the
-                    // stale/lost ring states.
+                    // stale/lost ring states. Keyed on senderId (originator),
+                    // never txNode -- attribution goes to whoever MEASURED
+                    // the position.
+                    const char *logStat = "nopos";
                     if (pkt.fixValid && pkt.msgType == MESH_MSG_POSITION) {
-                        rosterUpdate(pkt.senderId, pkt.latE7, pkt.lonE7, millis());
+                        RosterResult rr = rosterUpdate(pkt.senderId,
+                                                       pkt.latE7, pkt.lonE7,
+                                                       hopsTraveled, rssi, snr,
+                                                       millis());
+                        logStat = (rr == ROSTER_NEW) ? "new" : "upd";
                     }
+
+                    // Field log, one parseable line per processed packet:
+                    // LOG,millis,origin,via,hops,rssi,snr,dist_m,status
+                    // dist_m = -1 unless both ends held a fix.
+                    Serial.printf("LOG,%lu,%u,%u,%u,%.1f,%.1f,%.1f,%s\n",
+                                  (unsigned long)millis(), pkt.senderId,
+                                  pkt.txNode, hopsTraveled, rssi, snr,
+                                  stats.distValid ? stats.distM : -1.0,
+                                  logStat);
+                }
+                if (act == MESH_DROP_DUPLICATE) {
+                    // Duplicates get logged too -- they're relay EVIDENCE:
+                    // hearing the same packet again at hops>=1 proves a relay
+                    // fired even when the direct copy won the race.
+                    Serial.printf("LOG,%lu,%u,%u,%u,%.1f,%.1f,%.1f,dup\n",
+                                  (unsigned long)millis(), pkt.senderId,
+                                  pkt.txNode, hopsTraveled, rssi, snr, -1.0);
                 }
                 if (act == MESH_PROCESS_AND_RELAY) {
                     // Decision says relay; the QUEUE says when (SNR-weighted,

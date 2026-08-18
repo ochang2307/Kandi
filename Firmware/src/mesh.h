@@ -19,7 +19,7 @@
 
 // ============================== Per-board config =============================
 // Set DEVICE_ID uniquely per board before flashing (like IS_SENDER was).
-#define MESH_DEVICE_ID  1
+#define MESH_DEVICE_ID  3
 #define MESH_GROUP_ID   1
 
 // Testing hook: node ids this board pretends not to hear. Dropped at
@@ -30,7 +30,7 @@
 // Forces a multi-hop topology on a desk where everyone hears everyone:
 //   board 1: {3}   board 2: {}   board 3: {1}
 // gives the line 1 <-> 2 <-> 3 from network_test.py, with 2 as the only bridge.
-#define MESH_BLOCKED_SENDERS  {}
+#define MESH_BLOCKED_SENDERS  {1}
 
 // Design-doc cadence: position beacon every 10s with +/-2s jitter. Shorten
 // temporarily for impatient desk tests, but field tests use the real numbers

@@ -15,16 +15,17 @@ architecture changes.
 ## Current phase
 
 Phase 2: dev-board prototype, on **3× LilyGo T-Beam Supreme** boards
-(Arduino/PlatformIO, C++). Nearly complete: all peripherals up, all core
-logic ported and self-testing at boot, mesh verified on a 3-board desk
-topology, compasses calibrated and frame-corrected, and the full
-"find your friend" pipeline works — two boards point their rings at each
-other live, with the design doc's ring states (navigating/stale/lost/
-arrived) all verified. See the milestone list at the bottom for exact
-status.
+(Arduino/PlatformIO, C++). **Functionally complete** (2026-08): all
+peripherals up, all core logic ported and self-testing at boot, compasses
+calibrated and frame-corrected, the full "find your friend" pipeline working,
+and a 3-board field drive test that verified navigation, all ring states, and
+mesh relay across a 628m gap via a midpoint. See the milestone list at the
+bottom for exact status + the one open rigor item (an empty-blocked-list rerun
+to claim unforced relay).
 
-What remains in this phase: the park field demo + video (real distances —
-blink buckets, arrival re-arm, then the third board relaying at range).
+What remains before calling phase 2 fully closed: the demo video, and
+optionally the unforced-relay rerun. Then phase 3 (miniaturization toward the
+wrist form factor).
 
 ## Repo structure
 
@@ -528,6 +529,25 @@ formulaic writing.
      GPS noise at the threshold, cosmetic). Tunables if the feel is wrong:
      flash duration (8000ms) and re-arm distance (15m) in main.cpp; don't
      drop re-arm below ~13m or threshold noise re-fires the flash.
-     Blink buckets untested at range (backyard too small) — park-test item.
-7. Park field test + demo video. Then third board for mesh relay testing
-   (desk-verified already; the park run re-proves it at real range).
+   — FIELD-VERIFIED (2026-08): 3-board drive test. Blink-rate-closes and the
+     ARRIVED flash both confirmed at range. Multi-member roster page correct
+     in the field: pointer to a live member, distances at 264m/628m, states
+     transitioning. Also caught a real LOST→reacquire in the serial log
+     (member aged to 364s, then NAVIGATING age 0 when it came back).
+8. Third board / mesh relay at real range.
+   — FIELD-VERIFIED (2026-08): board 3 home (tethered, logging), board 2
+     dropped ~300m out as bridge, board 1 driven to 628m. Board 1's roster
+     showed member 3 at **628m, h1, d0 r15** — board 3's position delivered
+     ONLY via board 2's relay, RSSI -118 dBm / SNR -13.2 dB (~4dB over the
+     SF11 floor). Relay across a real-range gap, working.
+     CAVEAT for write-ups: the MESH_BLOCKED_SENDERS sim-blocks were STILL ON
+     during this run (board 3's log is full of dropped_blocked from board 1),
+     so the 1<->3 topology was FORCED, not proven distance-driven. At 628m the
+     direct link was almost certainly dead anyway (own data: 635m max, ~410m
+     body-worn; 1<->3 direct was already SNR -21 when closer) — but the block
+     masks the proof. For an airtight "unforced self-organization" claim, rerun
+     with empty blocked-lists at the same distance. Until then the honest
+     framing is "relay demonstrated at 628m via a midpoint", not "mesh
+     self-organized around a dead link".
+   Note: |M| ran ~63uT in the field vs 46-56 on the bench (nearby car steel,
+   likely) — headings stayed stable/sensible, but recal if enclosing near metal.

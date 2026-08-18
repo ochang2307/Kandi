@@ -207,6 +207,27 @@ bool runMeshSelfTests() {
         check("queue: hop decremented", out.hopLimit == 2, out.hopLimit, 2);
     }
 
+    // Originator identity must survive relay: the roster attributes positions
+    // to whoever MEASURED them, so a relay may only decrement hopLimit and
+    // stamp its own txNode -- senderId (and the payload) must pass through
+    // untouched. If this ever fails, roster attribution silently corrupts.
+    {
+        MeshNode relayer;
+        meshInit(relayer, 2, 1);                       // node 2 relays...
+        MeshPacket p = simPacket(1, 750, 3, 1);        // ...node 1's packet
+        p.latE7 = 372755809; p.lonE7 = -1220247906; p.fixValid = true;
+        meshHandlePacket(relayer, p, 1000);
+        meshScheduleRelay(relayer, p, 10.0f, 1000);
+        MeshPacket out;
+        bool got = meshRelayDue(relayer, 9999, out);
+        check("identity: relay popped", got, got, 1);
+        check("identity: senderId preserved", out.senderId == 1, out.senderId, 1);
+        check("identity: txNode = relayer", out.txNode == 2, out.txNode, 2);
+        check("identity: position untouched",
+              out.latE7 == p.latE7 && out.lonE7 == p.lonE7 && out.fixValid,
+              1, 1);
+    }
+
     // Duplicate heard mid-wait cancels the pending relay.
     {
         MeshNode n;

@@ -57,8 +57,15 @@ requires a phone app. Apple's offline finding only works at ~10-30m.
   re-fire it — the arrival threshold sits at the GNSS relative-error floor
   by design, which is the measured case for deferring final approach to UWB
   in v2.
-- 🔄 **In progress:** the park field demo — full "find your friend" walk at
-  real distances, plus the three-board relay at range.
+- ✅ **Three-board mesh relay confirmed in the field.** A drive test with one
+  node held back as a bridge relayed a member's position across a **628 m** gap
+  to a device receiving nothing from it directly — heard zero times direct,
+  fifteen times relayed, at −118 dBm / −13.2 dB SNR (≈4 dB above the SF11
+  demodulation floor). Navigation, distance-bucketed blink, and the arrival
+  flash all held at range, and the logs captured a live lost-then-reacquire as
+  a node came back into range.
+- 🔄 **In progress:** the demo video, and an empty-topology rerun to show the
+  mesh self-organizing without the desk-test range simulation still enabled.
 
 ## Hardware
 
@@ -118,10 +125,11 @@ synthetic sensor vectors, real LoRa transmit replaces a simulated one).
 | `roster.cpp` | Last-known position per mesh member; feeds the live navigation target |
 
 Every ported module ships with the **original Python test vectors as
-boot-time self-tests** — 38 cases across two suites: distance, bearing,
+boot-time self-tests** — 42 cases across two suites: distance, bearing,
 relative bearing, LED mapping, and wraparound asserted against the verified
-Python values, plus the mesh flooding scenarios (relay across a gap, loop
-termination via dedup, hop-limit expiry) re-run against in-memory device
+Python values, plus the mesh scenarios (relay across a gap, loop termination
+via dedup, hop-limit expiry, seen-cache expiry/eviction, SNR-weighted delay,
+and originator-identity-survives-relay) re-run against in-memory device
 instances on every power-up. A translation error surfaces at boot rather
 than in a field test.
 
@@ -148,6 +156,28 @@ neighborhood with houses in the signal path:
 - **Position freshness degrades before the link does.** Past ~550 m, gaps
   between received updates reached 15–25 s against a 10 s transmit cadence —
   validating the stale-bearing LED state specified months earlier.
+
+A later three-board drive test added the relay leg. One node was parked as a
+bridge ~300 m out while a second was driven to 628 m from a stationary,
+serial-logged third:
+
+| Link | Distance | RSSI | SNR | Hops |
+|---|---|---|---|---|
+| Endpoint → bridge (direct) | 264 m | −117 dBm | −11.5 dB | 0 |
+| Far endpoint's position, delivered via bridge | 628 m | −118 dBm | −13.2 dB | 1 |
+
+- **A position crossed a 628 m gap through a midpoint** to a device that
+  received it zero times directly and fifteen times relayed — managed flooding
+  extending reach past the direct link, at ~4 dB of SNR margin over the SF11
+  floor. Navigation, distance-bucketed blink, and the arrival flash all held at
+  range; the logs also caught a live lost-then-reacquire as the bridge came
+  back into range.
+- **Honest scope:** the desk-test range simulation (a compile-time per-node
+  block list) was still enabled, so this run *forces* the two-hop topology
+  rather than proving the endpoints were out of direct range — though the
+  earlier link budget (635 m max, ~410 m body-worn) says they almost certainly
+  were. An empty-topology rerun to demonstrate unforced self-organization is
+  the one remaining rigor item.
 
 ## Engineering notes
 
@@ -227,6 +257,5 @@ by antenna placement.
 
 ## Roadmap
 
-Two-device "find your friend" field demo (ring points at a live mesh member)
-→ three-board relay demo at real range → miniaturized integrated unit →
-wrist form factor → scaled field testing at progressively larger events.
+Demo video of the working system → miniaturized integrated unit → wrist form
+factor → scaled field testing at progressively larger events.

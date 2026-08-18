@@ -63,6 +63,129 @@ uint32_t blinkHalfMs = 800;   // NAVIGATING blink half-period (on time = off tim
 bool imuOk = false;        // did the IMU answer its chip-ID read at boot?
 bool magOk = false;        // ditto for the magnetometer
 
+#if MESH_MODE
+// --- Nav target selection (stand-in for the design doc's focus mode) ---
+// Auto-selects the FIRST member heard, then stays sticky -- with two boards
+// this is exactly the old most-recently-heard behavior, zero button needed.
+// A short press cycles through known members (manual override). If the
+// selected target goes LOST (>120s) while someone fresher is known, we fall
+// back to the most recently heard member rather than pointing at a corpse.
+uint8_t  navTargetId     = 0;      // 0 = nothing selected yet
+bool     navTargetManual = false;  // true after a manual cycle
+uint32_t targetToastUntil = 0;     // OLED "TARGET -> N" banner deadline
+
+// Roster OLED page toggle (long press). Debug single-target page stays the
+// default; the roster page is the field-test overview.
+bool rosterPageActive = false;
+
+// Arrival flash state -- file scope so the button handler can cancel it.
+bool     wasArrived = false;
+uint32_t arrivedFlashUntil = 0;
+
+// --- BOOT button gestures ---
+// Conflict resolution (explicit decision): a press that lands DURING the
+// arrival flash ONLY cancels the flash -- it does not also cycle the target
+// or flip the page; the release is swallowed. Outside the flash:
+//   short press (<600ms)  -> cycle nav target through the roster
+//   long press  (>=600ms) -> toggle the roster overview page
+// Rationale: canceling an 8s alarm is a reflex mash; it must never have the
+// side effect of re-aiming the navigation.
+static void buttonTick() {
+    static bool     pressed = false;
+    static uint32_t pressStartMs = 0;
+    static uint32_t lastEdgeMs = 0;
+    static bool     swallowRelease = false;
+
+    bool down = digitalRead(BUTTON_PIN) == LOW;
+    uint32_t now = millis();
+    if (now - lastEdgeMs < 30) return;   // debounce both edges
+
+    if (down && !pressed) {
+        pressed = true;
+        lastEdgeMs = now;
+        pressStartMs = now;
+        if (ringMode == RING_ARRIVED_FLASH) {
+            arrivedFlashUntil = 0;
+            ringMode = RING_ARRIVED_STEADY;   // immediate, not next tick
+            swallowRelease = true;
+        }
+    } else if (!down && pressed) {
+        pressed = false;
+        lastEdgeMs = now;
+        if (swallowRelease) {
+            swallowRelease = false;
+            return;
+        }
+        if (now - pressStartMs >= 600) {
+            rosterPageActive = !rosterPageActive;
+        } else {
+            uint8_t next = rosterNextId(navTargetId);
+            if (next != 0) {
+                navTargetId      = next;
+                navTargetManual  = true;
+                targetToastUntil = now + 2000;
+                Serial.printf("NAV: target cycled -> member %u\n", next);
+            }
+        }
+    }
+}
+
+// Roster overview page (long-press toggle). The field-test glance: every
+// known member with distance, position age, hops traveled by their latest
+// packet (0 = direct, >=1 = relayed to us), and link quality. '>' marks the
+// current nav target. With <=3 members each gets two lines (adds SNR and the
+// direct/relayed packet counts); more than 3 fall back to one line each.
+static void drawRosterPage(const GpsStatus &g) {
+    char line[24];
+    size_t n = rosterCount();
+    snprintf(line, sizeof(line), "ROSTER %u    N%d", (unsigned)n, MESH_DEVICE_ID);
+    oledText(0, 0, line);
+
+    if (n == 0) {
+        oledText(0, 3, "no members heard");
+        oledText(0, 5, "(long press: back)");
+        return;
+    }
+
+    RosterEntry e;
+    if (n <= 3) {
+        for (size_t i = 0; i < n; i++) {
+            if (!rosterByIndex(i, e)) break;
+            uint32_t age = (millis() - e.lastUpdateMs) / 1000;
+            char mark = (e.id == navTargetId) ? '>' : ' ';
+            if (g.valid) {
+                double d = distance(g.lat, g.lon, e.latE7 * 1e-7, e.lonE7 * 1e-7);
+                snprintf(line, sizeof(line), "%c%u %5.0fm %3lus  h%u",
+                         mark, e.id, d, (unsigned long)age, e.lastHops);
+            } else {
+                snprintf(line, sizeof(line), "%c%u  ----m %3lus  h%u",
+                         mark, e.id, (unsigned long)age, e.lastHops);
+            }
+            oledText(0, 2 + i * 2, line);
+            snprintf(line, sizeof(line), "  %4.0fdB s%4.1f d%ur%u",
+                     e.lastRssi, e.lastSnr,
+                     (unsigned)e.directCount, (unsigned)e.relayCount);
+            oledText(0, 3 + i * 2, line);
+        }
+    } else {
+        for (size_t i = 0; i < n && i < 7; i++) {
+            if (!rosterByIndex(i, e)) break;
+            uint32_t age = (millis() - e.lastUpdateMs) / 1000;
+            char mark = (e.id == navTargetId) ? '>' : ' ';
+            if (g.valid) {
+                double d = distance(g.lat, g.lon, e.latE7 * 1e-7, e.lonE7 * 1e-7);
+                snprintf(line, sizeof(line), "%c%u %4.0fm %3lus h%u %3.0f",
+                         mark, e.id, d, (unsigned long)age, e.lastHops, e.lastRssi);
+            } else {
+                snprintf(line, sizeof(line), "%c%u ---- %3lus h%u %3.0f",
+                         mark, e.id, (unsigned long)age, e.lastHops, e.lastRssi);
+            }
+            oledText(0, 1 + i, line);
+        }
+    }
+}
+#endif
+
 // Draw the current ring state. Called every ~25ms from loop().
 //
 // This is the display layer, so the logical->physical mapping lives HERE, not
@@ -260,6 +383,12 @@ void loop() {
     // Non-blocking, one I2C read per pass at most.
     calTick();
 
+#if MESH_MODE
+    // Button gestures every pass: flash-cancel needs to feel instant, and a
+    // 600ms long-press threshold needs better than 1Hz sampling.
+    buttonTick();
+#endif
+
     // Fast render tick: redraw the ring every ~25ms so the searching pulse
     // breathes smoothly. Costs ~0.5ms per frame over RMT (non-blocking for
     // I2C/interrupts), nowhere near the 250ms GPS overrun budget.
@@ -344,16 +473,39 @@ void loop() {
     bool   navValid = false;
 
 #if MESH_MODE
-    // Target = most recently heard mesh member with a real position.
+    // --- Target selection ---
+    // Sticky selected member, auto-seeded with the first one heard. Manual
+    // cycling (button) overrides; a LOST target with a fresher alternative
+    // falls back automatically.
     RosterEntry tgt;
-    bool haveTgt = rosterMostRecent(tgt);
+    bool haveTgt = false;
     uint32_t tgtAgeS = 0;
     uint8_t  tgtId = 0;
 
-    // Arrival flash bookkeeping: flash for ~8s on ENTERING arrived, then
-    // decay to steady. The BOOT button cancels the flash early.
-    static bool     wasArrived = false;
-    static uint32_t arrivedFlashUntil = 0;
+    if (navTargetId != 0 && rosterGet(navTargetId, tgt)) {
+        haveTgt = true;
+    }
+    if (!haveTgt && rosterMostRecent(tgt)) {
+        // Nothing selected yet (or the entry was evicted): auto-select.
+        navTargetId     = tgt.id;
+        navTargetManual = false;
+        haveTgt = true;
+    }
+    if (haveTgt && (millis() - tgt.lastUpdateMs) > 120000) {
+        // Selected target is LOST. If anyone fresher exists, point at the
+        // living instead of the dead -- manual choice included: stickiness
+        // is not worth a ring aimed at a 2-minute-old ghost.
+        RosterEntry alt;
+        if (rosterMostRecent(alt) && alt.id != tgt.id
+            && (millis() - alt.lastUpdateMs) <= 120000) {
+            tgt = alt;
+            navTargetId      = alt.id;
+            navTargetManual  = false;
+            targetToastUntil = millis() + 2000;   // announce the auto-switch
+            Serial.printf("NAV: target %u lost, falling back to member %u\n",
+                          tgtId, alt.id);
+        }
+    }
 
     if (!g.valid) {
         ringMode = RING_NO_FIX;
@@ -402,12 +554,6 @@ void loop() {
         }
     }
 
-    // BOOT button cancels the arrival flash (checked here at 1Hz is enough --
-    // a human press spans several ticks).
-    if (ringMode == RING_ARRIVED_FLASH && digitalRead(BUTTON_PIN) == LOW) {
-        arrivedFlashUntil = 0;
-        ringMode = RING_ARRIVED_STEADY;
-    }
 #else
     // Range-test builds: fixed waypoint, steady pointer (original behavior).
     navValid = g.valid && haveHeading;
@@ -424,10 +570,30 @@ void loop() {
 
     // Stack GPS, compass, sensor, and nav state on the OLED. Lines are kept
     // under 21 chars -- that's the 5x7 font's limit across 128px.
+    // Corrected field + magnitude: computed BEFORE the display-page branch
+    // because the serial MAG line (after oledShow) uses it on every page.
+    float magNorm = 0;
+    float cmx = 0, cmy = 0, cmz = 0;   // corrected field, device frame
+    if (haveMag) {
+        cmx = m.mx - magOffsetX;
+        cmy = m.my - magOffsetY;
+        cmz = m.mz - magOffsetZ;
+        magNorm = sqrtf(cmx * cmx + cmy * cmy + cmz * cmz);
+    }
+
     char line[24];
     oledClear();
 
     RadioStats r = radioStats();
+
+#if MESH_MODE
+    // Long-press page toggle: roster overview replaces the whole debug stack
+    // (brace closes just before oledShow, under the same #if).
+    if (rosterPageActive) {
+        drawRosterPage(g);
+    } else {
+#endif
+
 #if MESH_MODE
     // Mesh header: this node's id + own-beacon and processed-packet counts.
     snprintf(line, sizeof(line), "KANDI N%d T%lu R%lu",
@@ -466,14 +632,6 @@ void loop() {
     // something ferrous moved near the board). CAL/--- flags whether stored
     // offsets are loaded, i.e. whether the heading deserves any trust.
     // (Pitch/roll moved to serial-only -- the CMP line still has them.)
-    float magNorm = 0;
-    float cmx = 0, cmy = 0, cmz = 0;   // corrected field, device frame
-    if (haveMag) {
-        cmx = m.mx - magOffsetX;
-        cmy = m.my - magOffsetY;
-        cmz = m.mz - magOffsetZ;
-        magNorm = sqrtf(cmx * cmx + cmy * cmy + cmz * cmz);
-    }
     // Heading shown as magnetic/true: the gap between them should be exactly
     // the 13.0 declination constant -- eyeball proof the correction is live.
     // A phone compass set to "true north" should agree with the SECOND number.
@@ -593,6 +751,17 @@ void loop() {
                  g.valid ? "(no heading)" : "(no fix)");
     }
     oledText(0, 7, line);
+#endif
+
+#if MESH_MODE
+    }   // end !rosterPageActive
+
+    // Target-change toast: banner over the header for 2s after any cycle or
+    // automatic fallback, on whichever page is showing.
+    if (millis() < targetToastUntil) {
+        snprintf(line, sizeof(line), ">> TARGET: N%u <<", (unsigned)navTargetId);
+        oledText(0, 0, line);
+    }
 #endif
 
     oledShow();
