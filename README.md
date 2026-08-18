@@ -16,6 +16,13 @@ requires a phone app. Apple's offline finding only works at ~10-30m.
 
 **Kandi's thesis: sub-GHz LoRa range + screenless wrist UX + cultural fit.**
 
+## Demo
+
+Three devices navigating to each other in the field — LED ring direction
+finding, live distance, and a position relayed through a midpoint node.
+
+<!-- demo video link goes here -->
+
 ## Status
 
 - ✅ **Phase 1 — Design & architecture: complete.** Full engineering design
@@ -67,8 +74,10 @@ requires a phone app. Apple's offline finding only works at ~10-30m.
 - ✅ **Phase 2 complete — working three-device prototype.** Every layer of the
   design doc runs on hardware end-to-end: offline GPS-over-LoRa-mesh position
   sharing, multi-hop relay at real range, and glance-readable LED direction
-  finding, demonstrated across three devices in the field. Captured on video;
-  publishing next.
+  finding, demonstrated across three devices in the field and captured on
+  video.
+- 🔜 **Phase 3 — wearable enclosure, then measured power, then PCB work.**
+  See [What's next](#whats-next).
 
 ## Hardware
 
@@ -175,11 +184,16 @@ serial-logged third:
   floor. Navigation, distance-bucketed blink, and the arrival flash all held at
   range; the logs also caught a live lost-then-reacquire as the bridge came
   back into range.
-- **Deterministic topology.** The two-hop path was pinned with a compile-time
-  per-node range filter, so the relay behaviour is verified against a known
-  topology rather than left to chance line-of-sight — the same harness used to
-  validate relay, dedup, and hop-limit expiry on the bench, now exercised at
-  field range.
+- **Caveat: the topology was forced, not purely distance-driven.** The
+  compile-time 1↔3 blocklist used for bench testing was still active during
+  this run, so the endpoints were prevented from hearing each other rather
+  than being proven out of range. The earlier link budget says they very
+  likely were out of range anyway — 635 m measured maximum, ~410 m body-worn,
+  and the direct 1↔3 link was already down to −21 dB SNR at a shorter
+  distance — but that is inference, not measurement. An unforced rerun with
+  empty blocklists at the same distance is planned; until then the supported
+  claim is "relay across a 628 m gap via a midpoint," not "the mesh
+  self-organized around a dead link."
 
 ## Engineering notes
 
@@ -257,8 +271,53 @@ surfaced an unanticipated constraint, since an 11 dB gap between the outward
 and skin-facing sides of a wristband is a 2× range difference decided purely
 by antenna placement.
 
-## Roadmap
+## What's next
 
-With the three-device prototype proven end-to-end, phase 3 moves from dev
-boards to a custom integrated unit: miniaturized PCB → wrist form factor →
-scaled field testing at progressively larger events.
+The design doc's phase 3 called for migrating to an nRF52840 immediately.
+That is deferred: a custom RF board is the most expensive and highest-risk
+step available, and there is cheaper work that produces more evidence first.
+Revised order:
+
+**1. Enclosure CAD — a wearable prototype (next two weeks).**
+A 3D-printed forearm housing for the current dev boards. The T-Beam Supreme
+is ~115 × 33 × 28 mm, so the honest form factor at this stage is Pip-Boy
+style rather than a bracelet — this is a prototype housing, not an attempt at
+the product form factor. Several constraints are already fixed by
+measurement: the LoRa antenna sits on the outward face (the 11.2 dB body
+absorption figure makes that a 2× range decision), the GPS antenna faces up
+in the wrist-raised reading pose, fasteners near the magnetometer must be
+non-ferrous, and every board gets recalibrated after assembly since the
+enclosure changes the magnetic environment. Deliverable: units that can
+actually be worn, and a demo reshot with them on.
+
+**2. Power validation — measured, not modeled.**
+The design doc specifies adaptive duty cycling (GPS-displacement
+stationarity detection, GNSS duty-cycling while stationary, LED power
+gating) and projects 13–16 hr with a 30–40% improvement. None of that is
+implemented or measured yet. The plan is to build it and then measure
+before/after current draw, converting the modeled figure into a real one the
+same way the range estimate was converted into a measured 635 m. Stated
+plainly: an ESP32-S3 with an OLED will not approach the doc's 17.5 mA budget
+number, which was computed for different silicon — the goal is validating
+the strategy and quantifying the delta it buys, not defending a number.
+
+**3. PCB work, via a stepping stone.**
+Rather than jumping straight to a custom RF board, the intermediate step is a
+simple 2-layer PCB LED ring sized to the enclosure face. No RF, low risk, and
+it covers the entire fab workflow — schematic, layout, ordering, assembly —
+before that workflow has to carry a 915 MHz design. A full custom board
+(MCU + SX1262 + MAX-M10S) remains the longer-term target.
+
+**Open question: which MCU.** The design doc chose the nRF52840, but that
+predates the ESP32-S3 firmware that now exists and works. Staying on the S3
+preserves every driver and all the toolchain knowledge; moving to the
+nRF52840 buys power efficiency at the cost of rewriting each
+platform-specific driver. That trade should be decided with the power
+measurements from step 2 in hand, not before.
+
+### Deferred, deliberately
+
+Specified and consciously not built yet: group view / focus mode (a minimal
+target-cycling stand-in exists), the full button gesture map, BLE bonding
+(`group_id` is currently a compile-time constant), SOS, and haptics — the
+last blocked on custom hardware, since the dev board has no motor.

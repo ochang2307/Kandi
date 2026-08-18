@@ -14,18 +14,44 @@ architecture changes.
 
 ## Current phase
 
-Phase 2: dev-board prototype, on **3× LilyGo T-Beam Supreme** boards
-(Arduino/PlatformIO, C++). **Functionally complete** (2026-08): all
-peripherals up, all core logic ported and self-testing at boot, compasses
-calibrated and frame-corrected, the full "find your friend" pipeline working,
-and a 3-board field drive test that verified navigation, all ring states, and
-mesh relay across a 628m gap via a midpoint. See the milestone list at the
-bottom for exact status + the one open rigor item (an empty-blocked-list rerun
-to claim unforced relay).
+**Phase 2 (dev-board prototype): COMPLETE (2026-08).** On 3× LilyGo T-Beam
+Supreme boards (Arduino/PlatformIO, C++): all peripherals up, all core logic
+ported and self-testing at boot, compasses calibrated and frame-corrected, the
+full "find your friend" pipeline working, mesh relay demonstrated in the field
+across a 628m gap via a midpoint, and demo footage captured. See the milestone
+list at the bottom for exact status of each piece.
 
-What remains before calling phase 2 fully closed: the demo video, and
-optionally the unforced-relay rerun. Then phase 3 (miniaturization toward the
-wrist form factor).
+**Phase 3 is NOT the design doc's phase 3.** The doc calls for an immediate
+nRF52840 migration. The revised plan front-loads cheaper, higher-value work and
+defers the custom RF board. In order:
+
+1. **Enclosure CAD** (next two weeks, before school). A 3D-printed wrist-worn
+   housing for the CURRENT dev-board hardware. Pip-Boy style — the T-Beam
+   Supreme is ~115 × 33 × 28 mm, so forearm-length is the honest form factor
+   at this stage. Explicitly a prototype housing, NOT an attempt at the product
+   form factor; don't let scope creep in that direction. Deliverable: wearable
+   units + a reshot demo video with the devices actually worn. Constraints have
+   their own section below.
+2. **Power validation.** Implement the adaptive duty cycling the design doc
+   already specifies (GPS-displacement stationarity, GNSS duty-cycling while
+   stationary, LED power gating), then MEASURE before/after current draw. The
+   goal is converting the doc's modeled "13–16 hr / 30–40% improvement" into
+   measured numbers, the same way the range claims were converted. Say up front
+   that ESP32-S3 + OLED will NOT approach the 17.5 mA budget figure — that
+   number was computed for different silicon. The aim is validating the
+   strategy and quantifying the delta, not hitting the number.
+3. **PCB work, with a stepping stone.** Before a full custom RF board, do a
+   simple 2-layer PCB LED ring sized to the enclosure face — no RF, low risk,
+   and it teaches the whole fab workflow (schematic → layout → fab → assembly).
+   A full custom board (MCU + SX1262 + MAX-M10S) stays a longer-term ambition.
+
+**Open decision — MCU for the first miniaturization.** The design doc picked
+the nRF52840, but that choice predates the ESP32-S3 firmware that now exists.
+Staying on the S3 preserves every driver and all the toolchain knowledge;
+switching to the nRF52840 gains power efficiency but means rewriting every
+platform-specific driver (PMU, OLED, GPS UART, IMU/mag, radio glue, NVS,
+FastLED/RMT). Treat this as open rather than settled — decide it with the
+power measurements from step 2 in hand.
 
 ## Repo structure
 
@@ -108,6 +134,29 @@ board revision before trusting):
 Safety: NEVER transmit without the LoRa antenna attached — it can destroy
 the RF output stage. Any firmware that could TX at boot must be flashed
 with the antenna on.
+
+## Enclosure design constraints (phase 3, step 1)
+
+A 3D-printed forearm-worn housing for the dev boards. These constraints are
+not style preferences — each one is either a measured result or a thing that
+has already broken once.
+
+- **LoRa antenna on the OUTWARD face, away from the wrist.** Field-measured
+  body absorption is 11.2 dB, roughly a 2× range difference decided purely by
+  antenna placement. This is the single highest-stakes placement decision in
+  the whole enclosure.
+- **GPS antenna faces UP when the wrist is raised to read the ring.** The
+  reading pose is the pose that has to hold a fix.
+- **No ferrous fasteners near the magnetometer** — nylon or plastic screws
+  only. Steel hardware becomes a hard-iron offset that rides with the device.
+- **Recalibrate the magnetometer after assembly** (`calclear` then `cal`, per
+  board). The enclosure changes the magnetic environment the same way the
+  18650 did; calibrate in the exact configuration the device will run in.
+- **Keep physical access to:** USB-C (reflashing), the BOOT and RESET buttons,
+  the LED ring face, and the OLED. The OLED is still the field-debug readout
+  even though the product is screenless.
+- **Diffusion layer over the LED ring.** Bare WS2812s are harsh point sources;
+  the ring needs to read as sectors, not as dots.
 
 ## Firmware bring-up notes (hard-won — read before touching any peripheral)
 
@@ -464,6 +513,26 @@ plot; gaps in the counter sequence are packet-loss-vs-distance for free.
 runs fine). Build + flash + watch serial in one shot:
 `~/.platformio/penv/bin/pio run -t upload -t monitor` (Ctrl-C quits monitor).
 
+## Deferred (deliberately — not missing)
+
+These are specified in the design doc and consciously NOT built yet. Don't
+treat them as gaps or "fix" them unasked; each is scheduled behind something
+with more value per hour right now.
+
+- **Group view / focus mode** — multi-member display. A minimal stand-in
+  exists (short-press cycles the nav target, long-press shows the roster
+  page); the full design-doc interaction is later.
+- **Full button gesture map.** Currently three gestures on the BOOT button.
+- **BLE bonding.** `group_id` is a compile-time constant; real groups need
+  the bonding flow and a shared AES key.
+- **SOS.** Reserved in the LED state hierarchy, not implemented.
+- **Haptics.** No motor on the dev board — this is blocked on custom hardware,
+  and it is the design doc's answer for final approach alongside UWB.
+- **Unforced relay rerun.** Redo the 628m relay test with empty
+  `MESH_BLOCKED_SENDERS` to show the mesh self-organizing around a genuinely
+  dead link rather than a simulated one. See milestone 7 for why this matters
+  to how the result is worded.
+
 ## Working style
 
 Owen is learning as he builds — that's half the point of the project.
@@ -479,6 +548,10 @@ paste elsewhere is not a requirement, but he dislikes overly polished
 formulaic writing.
 
 ## Near-term milestones (in order)
+
+Items 1–7 are phase 2 and are all DONE — kept as a log of what was verified
+and how, since the "how" is what a later regression gets checked against.
+Phase 3 (8–10) is summarized in Current phase at the top of this file.
 
 1. Toolchain bring-up: flash a blink/hello to one T-Beam via PlatformIO.
    — DONE.
@@ -534,7 +607,7 @@ formulaic writing.
      in the field: pointer to a live member, distances at 264m/628m, states
      transitioning. Also caught a real LOST→reacquire in the serial log
      (member aged to 364s, then NAVIGATING age 0 when it came back).
-8. Third board / mesh relay at real range.
+7. Third board / mesh relay at real range.
    — FIELD-VERIFIED (2026-08): board 3 home (tethered, logging), board 2
      dropped ~300m out as bridge, board 1 driven to 628m. Board 1's roster
      showed member 3 at **628m, h1, d0 r15** — board 3's position delivered
@@ -551,3 +624,18 @@ formulaic writing.
      self-organized around a dead link".
    Note: |M| ran ~63uT in the field vs 46-56 on the bench (nearby car steel,
    likely) — headings stayed stable/sensible, but recal if enclosing near metal.
+
+--- phase 3 (current) — see Current phase for the reasoning behind the order ---
+
+8. Enclosure CAD: 3D-printed forearm housing for the dev boards, wearable
+   units + reshot demo video with the devices worn. Constraints are in the
+   Enclosure design constraints section. Recalibrate every board after
+   assembly.
+9. Power validation: implement the design doc's adaptive duty cycling
+   (GPS-displacement stationarity, GNSS duty-cycle when stationary, LED
+   gating), then measure before/after current draw. Deliverable is a measured
+   delta, not a target number — the 17.5 mA budget figure was computed for
+   different silicon.
+10. PCB stepping stone: 2-layer LED ring board sized to the enclosure face,
+    no RF. Full custom board (MCU + SX1262 + MAX-M10S) after that, with the
+    MCU choice (ESP32-S3 vs nRF52840) decided using milestone 9's numbers.
