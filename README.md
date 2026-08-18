@@ -92,7 +92,7 @@ Revised order:
 
 **1. Enclosure CAD — a wearable prototype (next two weeks).**
 A 3D-printed forearm housing for the current dev boards. The T-Beam Supreme
-is ~115 × 33 × 28 mm, so the honest form factor at this stage is Pip-Boy
+is ~115 × 33 × 28 mm, so the form factor at this stage is Pip-Boy
 style rather than a bracelet — this is a prototype housing, not an attempt at
 the product form factor. Several constraints are already fixed by
 measurement: the LoRa antenna sits on the outward face (the 11.2 dB body
