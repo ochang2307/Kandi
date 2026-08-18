@@ -24,7 +24,7 @@ requires a phone app. Apple's offline finding only works at ~10-30m.
 
 Three devices navigating to each other in the field — LED ring direction
 finding, live distance, and a position relayed through a midpoint node.
-
+!WILL BE UPLOADED SOON!
 <!-- demo video link goes here -->
 
 ## Status
