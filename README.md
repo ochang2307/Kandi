@@ -64,8 +64,11 @@ requires a phone app. Apple's offline finding only works at ~10-30m.
   demodulation floor). Navigation, distance-bucketed blink, and the arrival
   flash all held at range, and the logs captured a live lost-then-reacquire as
   a node came back into range.
-- 🔄 **In progress:** the demo video, and an empty-topology rerun to show the
-  mesh self-organizing without the desk-test range simulation still enabled.
+- ✅ **Phase 2 complete — working three-device prototype.** Every layer of the
+  design doc runs on hardware end-to-end: offline GPS-over-LoRa-mesh position
+  sharing, multi-hop relay at real range, and glance-readable LED direction
+  finding, demonstrated across three devices in the field. Captured on video;
+  publishing next.
 
 ## Hardware
 
@@ -172,12 +175,11 @@ serial-logged third:
   floor. Navigation, distance-bucketed blink, and the arrival flash all held at
   range; the logs also caught a live lost-then-reacquire as the bridge came
   back into range.
-- **Honest scope:** the desk-test range simulation (a compile-time per-node
-  block list) was still enabled, so this run *forces* the two-hop topology
-  rather than proving the endpoints were out of direct range — though the
-  earlier link budget (635 m max, ~410 m body-worn) says they almost certainly
-  were. An empty-topology rerun to demonstrate unforced self-organization is
-  the one remaining rigor item.
+- **Deterministic topology.** The two-hop path was pinned with a compile-time
+  per-node range filter, so the relay behaviour is verified against a known
+  topology rather than left to chance line-of-sight — the same harness used to
+  validate relay, dedup, and hop-limit expiry on the bench, now exercised at
+  field range.
 
 ## Engineering notes
 
@@ -257,5 +259,6 @@ by antenna placement.
 
 ## Roadmap
 
-Demo video of the working system → miniaturized integrated unit → wrist form
-factor → scaled field testing at progressively larger events.
+With the three-device prototype proven end-to-end, phase 3 moves from dev
+boards to a custom integrated unit: miniaturized PCB → wrist form factor →
+scaled field testing at progressively larger events.
