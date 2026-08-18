@@ -22,7 +22,7 @@ requires a phone app. Apple's offline finding only works at ~10-30m.
   doc covering radio selection (SX1262, LoRa "Long Fast", 915MHz), mesh
   protocol (managed flooding), GNSS (u-blox MAX-M10S + A-GNSS), power budget
   (~13-16hr projected on 400mAh), LED UX, bonding flow, and risk analysis.
-  → [Design doc]([https://docs.google.com/document/d/1ndvAmwJ7iS_GCs7uOu1srA6J-rN4ECKuPedQrF4hdPo/edit?usp=sharing](https://docs.google.com/document/d/1ndvAmwJ7iS_GCs7uOu1srA6J-rN4ECKuPedQrF4hdPo/edit?tab=t.4cz32g8cwkpv))
+  → [Design doc](https://docs.google.com/document/d/1ndvAmwJ7iS_GCs7uOu1srA6J-rN4ECKuPedQrF4hdPo/edit?tab=t.4cz32g8cwkpv)
 - ✅ **Phase 2 core logic: complete.** The full navigation and networking
   stack, implemented and unit-tested in platform-independent Python and
   validated in simulation before any hardware existed.
