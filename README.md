@@ -183,7 +183,7 @@ serial-logged third:
 
 ## Engineering notes
 
-A few problems worth documenting, since debugging them was most of the work:
+A few problems worth documenting:
 
 **Magnetometer squatting on the display's address.** The QMC6310N answers at
 I2C `0x3C` — the address essentially every OLED library assumes by default.
