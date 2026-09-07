@@ -1,0 +1,60 @@
+{
+  "review_date": "2026-09-07",
+  "scope": "Only two restored sources against existing Kandi handoff; no full migration rerun, firmware changes, source-binary edits or historical archive rewrite.",
+  "sources": [
+    {
+      "id": "R01",
+      "path": "Kandi.pdf",
+      "bytes": 870091,
+      "sha256": "a5ce5936931f10c9efa66afc92e724654fe1ae1d2f316c844af1879a84ad8039",
+      "pages": 30,
+      "metadata": {
+        "Title": "Kandi",
+        "Producer": "Skia/PDF m154 Google Docs Renderer",
+        "CreationDate": null,
+        "ModDate": null
+      },
+      "review": "All page text, page overview, embedded radio/power images and relevant tables",
+      "historical_attachment_uuid_match": null,
+      "state_inference": "July field-update stage; calibration and mesh still pending in source, superseded by August implementation and roadmap"
+    },
+    {
+      "id": "R02",
+      "path": "Kandi Power Budgeting.xlsx",
+      "bytes": 52791,
+      "sha256": "3ee3a92c1c5ab78ec776540b6fc6f34e634a673c571f81137c167f56e611a4c4",
+      "sheets": [
+        "Sheet1"
+      ],
+      "meaningful_range": "Sheet1!A1:G30",
+      "metadata": {
+        "creator": "openpyxl",
+        "created": "2026-09-07T16:54:22.598664",
+        "modified": "2026-09-07T16:54:22.598664",
+        "timezone": "not recorded"
+      },
+      "review": "All nonempty cells, sole formula and cached value, notes, rendered populated table; no recalculation saved to source",
+      "formula": {
+        "cell": "E24",
+        "formula": "=SUM(E2:E20)",
+        "cached_and_recomputed_value": 17.482115
+      },
+      "omissions": {
+        "E22_overhead_mA": 1.5,
+        "E6": "blank; C6*D6 implies 0.001032 mA"
+      },
+      "sum_including_overhead_mA": 18.982115,
+      "sum_including_overhead_and_implied_sleep_mA": 18.983147,
+      "runtime_cells": "B25:B30 are literal text",
+      "status": "MODELED; arithmetic review only, not measured or validated battery runtime"
+    }
+  ],
+  "updated_documents": [
+    "KANDI_PROJECT_CONTEXT.md",
+    "Kandi_Current_State.md",
+    "KANDI_SOURCE_MAP.md",
+    "KANDI_IMPORTANT_MATERIAL.md",
+    "KANDI_OPEN_THREADS.md",
+    "KANDI_TIMELINE.md"
+  ]
+}
